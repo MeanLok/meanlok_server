@@ -1,13 +1,22 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { PageRole, type Profile } from '@prisma/client';
+import {
+  LinkInviteMode,
+  PageAccessRequestStatus,
+  PageRole,
+  type Profile,
+} from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AcceptPageInviteDto } from './dto/accept-page-invite.dto';
 import { CreatePageShareDto } from './dto/create-page-share.dto';
+import {
+  PageAccessRequestAction,
+} from './dto/handle-page-access-request.dto';
 import { UpdatePageShareDto } from './dto/update-page-share.dto';
 
 const PAGE_ROLE_PRIORITY: Record<PageRole, number> = {
@@ -46,6 +55,10 @@ export class PageSharesService {
 
   private createLinkOnlyInviteEmail() {
     return `link-${randomBytes(8).toString('hex')}@share.meanlok.local`;
+  }
+
+  private isLinkOnlyInviteEmail(email: string) {
+    return email.startsWith('link-') && email.endsWith('@share.meanlok.local');
   }
 
   private async createInvite(params: {
@@ -89,6 +102,22 @@ export class PageSharesService {
       role: share.role,
       user: share.user,
       createdAt: share.createdAt,
+    };
+  }
+
+  private accessRequestOutput(request: {
+    id: string;
+    role: PageRole;
+    status: PageAccessRequestStatus;
+    createdAt: Date;
+    user: { id: string; email: string; name: string };
+  }) {
+    return {
+      id: request.id,
+      role: request.role,
+      status: request.status,
+      createdAt: request.createdAt,
+      user: request.user,
     };
   }
 
@@ -400,6 +429,106 @@ export class PageSharesService {
     });
   }
 
+  async listAccessRequests(workspaceId: string, pageId: string) {
+    await this.getPageOrThrow(workspaceId, pageId);
+
+    const requests = await this.prisma.pageAccessRequest.findMany({
+      where: {
+        pageId,
+        status: PageAccessRequestStatus.PENDING,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            name: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    });
+
+    return requests.map((request) => this.accessRequestOutput(request));
+  }
+
+  async handleAccessRequest(
+    workspaceId: string,
+    pageId: string,
+    requestId: string,
+    handler: Profile,
+    action: PageAccessRequestAction,
+  ) {
+    const request = await this.prisma.pageAccessRequest.findUnique({
+      where: { id: requestId },
+      select: {
+        id: true,
+        pageId: true,
+        role: true,
+        userId: true,
+        status: true,
+        page: {
+          select: {
+            workspaceId: true,
+          },
+        },
+      },
+    });
+
+    if (!request || request.pageId !== pageId || request.page.workspaceId !== workspaceId) {
+      throw new NotFoundException('Page access request not found');
+    }
+
+    if (request.status !== PageAccessRequestStatus.PENDING) {
+      throw new BadRequestException('Page access request already handled');
+    }
+
+    if (action === PageAccessRequestAction.APPROVE) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.pageShare.upsert({
+          where: {
+            pageId_userId: {
+              pageId,
+              userId: request.userId,
+            },
+          },
+          create: {
+            pageId,
+            userId: request.userId,
+            role: request.role,
+          },
+          update: {
+            role: request.role,
+          },
+        });
+
+        await tx.pageAccessRequest.update({
+          where: { id: request.id },
+          data: {
+            status: PageAccessRequestStatus.APPROVED,
+            handledById: handler.id,
+            handledAt: new Date(),
+          },
+        });
+      });
+
+      return { ok: true };
+    }
+
+    await this.prisma.pageAccessRequest.update({
+      where: { id: request.id },
+      data: {
+        status: PageAccessRequestStatus.REJECTED,
+        handledById: handler.id,
+        handledAt: new Date(),
+      },
+    });
+
+    return { ok: true };
+  }
+
   async revokeInvite(workspaceId: string, pageId: string, inviteId: string) {
     const deleted = await this.prisma.pageInvite.deleteMany({
       where: {
@@ -416,6 +545,48 @@ export class PageSharesService {
     }
 
     return { ok: true };
+  }
+
+  async getInvitePreview(token: string) {
+    const invite = await this.prisma.pageInvite.findUnique({
+      where: { token },
+      include: {
+        page: {
+          select: {
+            id: true,
+            title: true,
+            workspace: {
+              select: {
+                id: true,
+                name: true,
+                linkInviteMode: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!invite) {
+      throw new NotFoundException('Page invite not found');
+    }
+
+    if (invite.expiresAt <= new Date()) {
+      throw new BadRequestException('Page invite expired');
+    }
+
+    if (invite.acceptedAt) {
+      throw new BadRequestException('Page invite already accepted');
+    }
+
+    return {
+      pageId: invite.page.id,
+      pageTitle: invite.page.title,
+      workspaceId: invite.page.workspace.id,
+      workspaceName: invite.page.workspace.name,
+      role: invite.role,
+      linkInviteMode: invite.page.workspace.linkInviteMode,
+    };
   }
 
   async acceptInvite(user: Profile, dto: AcceptPageInviteDto) {
@@ -435,12 +606,102 @@ export class PageSharesService {
       throw new NotFoundException('Page invite not found');
     }
 
+    if (invite.expiresAt <= new Date()) {
+      throw new BadRequestException('Page invite expired');
+    }
+
+    const normalizedInviteEmail = this.normalizeEmail(invite.email);
+    const normalizedUserEmail = this.normalizeEmail(user.email);
+    const linkOnlyInvite = this.isLinkOnlyInviteEmail(normalizedInviteEmail);
+
     if (invite.acceptedAt) {
       throw new BadRequestException('Page invite already accepted');
     }
 
-    if (invite.expiresAt <= new Date()) {
-      throw new BadRequestException('Page invite expired');
+    // Email-based invites must be accepted by the same email account only.
+    if (!linkOnlyInvite && normalizedInviteEmail !== normalizedUserEmail) {
+      throw new ForbiddenException('Invite email does not match current account');
+    }
+
+    if (linkOnlyInvite) {
+      const workspace = await this.prisma.workspace.findUnique({
+        where: { id: invite.page.workspaceId },
+        select: {
+          linkInviteMode: true,
+        },
+      });
+
+      if (!workspace) {
+        throw new NotFoundException('Workspace not found');
+      }
+
+      if (workspace.linkInviteMode === LinkInviteMode.REQUEST) {
+        const existingShare = await this.prisma.pageShare.findUnique({
+          where: {
+            pageId_userId: {
+              pageId: invite.pageId,
+              userId: user.id,
+            },
+          },
+          select: {
+            id: true,
+          },
+        });
+
+        if (existingShare) {
+          await this.prisma.pageInvite.update({
+            where: { id: invite.id },
+            data: {
+              acceptedAt: new Date(),
+            },
+          });
+
+          return {
+            workspaceId: invite.page.workspaceId,
+            pageId: invite.page.id,
+            status: 'granted' as const,
+          };
+        }
+
+        const request = await this.prisma.$transaction(async (tx) => {
+          const nextRequest = await tx.pageAccessRequest.upsert({
+            where: {
+              pageId_userId: {
+                pageId: invite.pageId,
+                userId: user.id,
+              },
+            },
+            create: {
+              pageId: invite.pageId,
+              userId: user.id,
+              role: invite.role,
+              status: PageAccessRequestStatus.PENDING,
+            },
+            update: {
+              role: invite.role,
+              status: PageAccessRequestStatus.PENDING,
+              handledById: null,
+              handledAt: null,
+            },
+          });
+
+          await tx.pageInvite.update({
+            where: { id: invite.id },
+            data: {
+              acceptedAt: new Date(),
+            },
+          });
+
+          return nextRequest;
+        });
+
+        return {
+          workspaceId: invite.page.workspaceId,
+          pageId: invite.page.id,
+          status: 'requested' as const,
+          requestId: request.id,
+        };
+      }
     }
 
     await this.prisma.$transaction(async (tx) => {
@@ -472,6 +733,7 @@ export class PageSharesService {
     return {
       workspaceId: invite.page.workspaceId,
       pageId: invite.page.id,
+      status: 'granted' as const,
     };
   }
 }

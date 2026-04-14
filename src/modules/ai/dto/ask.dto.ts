@@ -1,6 +1,6 @@
 import { IsString } from 'class-validator';
 
-export class SummarizeDto {
+export class AskDto {
   @IsString()
-  text!: string;
+  question!: string;
 }

@@ -1,27 +1,22 @@
-import { Body, Controller, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import type { Profile } from '@prisma/client';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { AiService } from './ai.service';
-import { DraftDto } from './dto/draft.dto';
-import { RefineDto } from './dto/refine.dto';
-import { SummarizeDto } from './dto/summarize.dto';
+import { AskDto } from './dto/ask.dto';
 
 @Controller('ai')
 @UseGuards(JwtAuthGuard)
 export class AiController {
   constructor(private readonly aiService: AiService) {}
 
-  @Post('summarize')
-  summarize(@Body() dto: SummarizeDto) {
-    return this.aiService.summarize(dto.text);
+  @Get('usage')
+  getUsage(@CurrentUser() user: Profile) {
+    return this.aiService.getUsage(user.id);
   }
 
-  @Post('refine')
-  refine(@Body() dto: RefineDto) {
-    return this.aiService.refine(dto.text);
-  }
-
-  @Post('draft')
-  draft(@Body() dto: DraftDto) {
-    return this.aiService.draft(dto.prompt);
+  @Post('ask')
+  ask(@CurrentUser() user: Profile, @Body() dto: AskDto) {
+    return this.aiService.ask(user.id, dto.question);
   }
 }

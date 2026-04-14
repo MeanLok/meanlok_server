@@ -58,10 +58,41 @@ export class InvitesService {
     return { ok: true };
   }
 
+  async getInvitePreview(token: string) {
+    const invite = await this.prisma.invite.findUnique({
+      where: { token },
+      include: {
+        workspace: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    if (!invite) {
+      throw new NotFoundException('Invite not found');
+    }
+
+    if (invite.acceptedAt) {
+      throw new BadRequestException('Invite already accepted');
+    }
+
+    if (invite.expiresAt <= new Date()) {
+      throw new BadRequestException('Invite expired');
+    }
+
+    return {
+      workspaceId: invite.workspace.id,
+      workspaceName: invite.workspace.name,
+      role: invite.role,
+    };
+  }
+
   async accept(user: Profile, dto: AcceptInviteDto) {
     const invite = await this.prisma.invite.findUnique({
       where: { token: dto.token },
-      include: { workspace: true },
     });
 
     if (!invite) {
@@ -106,8 +137,8 @@ export class InvitesService {
       });
     });
 
-    return this.prisma.workspace.findUnique({
-      where: { id: invite.workspaceId },
-    });
+    return {
+      workspaceId: invite.workspaceId,
+    };
   }
 }

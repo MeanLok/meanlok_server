@@ -20,6 +20,9 @@ model Profile {
   invitesSent     Invite[]          @relation("InviteInviter")
   pageShares      PageShare[]       @relation("PageShareUser")
   pageInvitesSent PageInvite[]      @relation("PageInviteInviter")
+  pageAccessRequests        PageAccessRequest[] @relation("PageAccessRequestUser")
+  handledPageAccessRequests PageAccessRequest[] @relation("PageAccessRequestHandler")
+  aiDailyUsages            AiDailyUsage[]
 }
 
 model Workspace {
@@ -27,6 +30,7 @@ model Workspace {
   name      String
   ownerId   String
   owner     Profile           @relation("WorkspaceOwner", fields: [ownerId], references: [id])
+  linkInviteMode LinkInviteMode @default(OPEN)
   createdAt DateTime          @default(now())
   updatedAt DateTime          @updatedAt
   members   WorkspaceMember[]
@@ -43,6 +47,17 @@ enum Role {
 enum PageRole {
   EDITOR
   VIEWER
+}
+
+enum LinkInviteMode {
+  OPEN
+  REQUEST
+}
+
+enum PageAccessRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }
 
 model WorkspaceMember {
@@ -73,6 +88,7 @@ model Page {
   document    Document?
   shares      PageShare[]
   invites     PageInvite[]
+  accessRequests PageAccessRequest[]
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
@@ -137,4 +153,36 @@ model PageInvite {
 
   @@index([pageId])
   @@index([email])
+}
+
+model PageAccessRequest {
+  id          String                  @id @default(cuid())
+  pageId      String
+  page        Page                    @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  userId      String
+  user        Profile                 @relation("PageAccessRequestUser", fields: [userId], references: [id], onDelete: Cascade)
+  role        PageRole                @default(VIEWER)
+  status      PageAccessRequestStatus @default(PENDING)
+  handledById String?
+  handledBy   Profile?                @relation("PageAccessRequestHandler", fields: [handledById], references: [id], onDelete: SetNull)
+  handledAt   DateTime?
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+
+  @@unique([pageId, userId])
+  @@index([pageId, status])
+  @@index([userId])
+}
+
+model AiDailyUsage {
+  id        String   @id @default(cuid())
+  userId    String
+  user      Profile  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dateKey   String
+  usedCount Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, dateKey])
+  @@index([dateKey])
 }

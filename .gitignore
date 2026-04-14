@@ -33,3 +33,7 @@ tmp/
 
 # OS files
 .DS_Store
+
+# AI assistant context files
+AGENTS.md
+CLAUDE.md
