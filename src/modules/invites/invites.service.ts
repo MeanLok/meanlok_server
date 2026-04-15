@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { Role, type Profile } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AcceptInviteDto } from './dto/accept-invite.dto';
@@ -53,8 +54,14 @@ export class InvitesService {
     return this.toInviteOutput(invite, rawToken);
   }
 
-  async findPending(workspaceId: string) {
-    const invites = await this.prisma.invite.findMany({
+  async findPending(workspaceId: string, query: PaginationQueryDto) {
+    const offset = Math.max(0, Number(query.offset ?? 0));
+    const requestedLimit = Number(query.limit ?? 100);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(200, Math.max(1, Math.trunc(requestedLimit)))
+      : 100;
+
+    const chunk = await this.prisma.invite.findMany({
       where: {
         workspaceId,
         acceptedAt: null,
@@ -62,10 +69,18 @@ export class InvitesService {
           gt: new Date(),
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      skip: offset,
+      take: limit + 1,
     });
 
-    return invites.map((invite) => this.toInviteOutput(invite));
+    const hasMore = chunk.length > limit;
+    const invites = hasMore ? chunk.slice(0, limit) : chunk;
+
+    return {
+      items: invites.map((invite) => this.toInviteOutput(invite)),
+      nextOffset: hasMore ? offset + limit : null,
+    };
   }
 
   async remove(workspaceId: string, inviteId: string) {

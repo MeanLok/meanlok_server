@@ -9,6 +9,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { Profile } from '@prisma/client';
+import { WorkspacePageParamDto } from '../../common/dto/route-params.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PageAccess } from '../../common/decorators/page-access.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -22,41 +23,52 @@ import { PageSharesService } from './page-shares.service';
 export class PageSharesController {
   constructor(private readonly pageSharesService: PageSharesService) {}
 
-  @PageAccess('VIEWER')
+  @PageAccess('EDITOR')
   @Get()
-  list(@Param('workspaceId') workspaceId: string, @Param('pageId') pageId: string) {
-    return this.pageSharesService.listShares(workspaceId, pageId);
+  list(@Param() params: WorkspacePageParamDto) {
+    return this.pageSharesService.listShares(params.workspaceId, params.pageId);
   }
 
   @PageAccess('EDITOR')
   @Post()
   create(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @CurrentUser() user: Profile,
     @Body() dto: CreatePageShareDto,
   ) {
-    return this.pageSharesService.addShare(workspaceId, pageId, user, dto);
+    return this.pageSharesService.addShare(
+      params.workspaceId,
+      params.pageId,
+      user,
+      dto,
+    );
   }
 
   @PageAccess('EDITOR')
   @Patch(':shareId')
   update(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @Param('shareId') shareId: string,
     @Body() dto: UpdatePageShareDto,
   ) {
-    return this.pageSharesService.updateShare(workspaceId, pageId, shareId, dto);
+    return this.pageSharesService.updateShare(
+      params.workspaceId,
+      params.pageId,
+      shareId,
+      dto,
+    );
   }
 
   @PageAccess('EDITOR')
   @Delete(':shareId')
   remove(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @Param('shareId') shareId: string,
   ) {
-    return this.pageSharesService.removeShare(workspaceId, pageId, shareId);
+    return this.pageSharesService.removeShare(
+      params.workspaceId,
+      params.pageId,
+      shareId,
+    );
   }
 }

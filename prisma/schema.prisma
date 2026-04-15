@@ -71,6 +71,7 @@ model WorkspaceMember {
   updatedAt   DateTime  @updatedAt
 
   @@unique([userId, workspaceId])
+  @@index([workspaceId])
 }
 
 model Page {
@@ -93,6 +94,7 @@ model Page {
   updatedAt   DateTime  @updatedAt
 
   @@index([workspaceId, parentId, order])
+  @@index([workspaceId, order, id])
   @@index([parentId])
 }
 

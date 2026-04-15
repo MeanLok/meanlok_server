@@ -9,6 +9,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Role, type Profile } from '@prisma/client';
+import { WorkspaceParamDto } from '../../common/dto/route-params.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { WorkspaceRole } from '../../common/decorators/workspace-role.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -34,32 +35,32 @@ export class WorkspacesController {
 
   @UseGuards(WorkspaceRoleGuard)
   @Get(':workspaceId')
-  findOne(@Param('workspaceId') workspaceId: string, @CurrentUser() user: Profile) {
-    return this.workspacesService.findOne(workspaceId, user.id);
+  findOne(@Param() params: WorkspaceParamDto, @CurrentUser() user: Profile) {
+    return this.workspacesService.findOne(params.workspaceId, user.id);
   }
 
   @Get(':workspaceId/public-info')
   getPublicInfo(
-    @Param('workspaceId') workspaceId: string,
+    @Param() params: WorkspaceParamDto,
     @CurrentUser() user: Profile,
   ) {
-    return this.workspacesService.getPublicInfo(workspaceId, user);
+    return this.workspacesService.getPublicInfo(params.workspaceId, user);
   }
 
   @UseGuards(WorkspaceRoleGuard)
   @WorkspaceRole(Role.OWNER)
   @Patch(':workspaceId')
   update(
-    @Param('workspaceId') workspaceId: string,
+    @Param() params: WorkspaceParamDto,
     @Body() dto: UpdateWorkspaceDto,
   ) {
-    return this.workspacesService.update(workspaceId, dto);
+    return this.workspacesService.update(params.workspaceId, dto);
   }
 
   @UseGuards(WorkspaceRoleGuard)
   @WorkspaceRole(Role.OWNER)
   @Delete(':workspaceId')
-  remove(@Param('workspaceId') workspaceId: string) {
-    return this.workspacesService.remove(workspaceId);
+  remove(@Param() params: WorkspaceParamDto) {
+    return this.workspacesService.remove(params.workspaceId);
   }
 }

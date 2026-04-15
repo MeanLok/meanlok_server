@@ -4,9 +4,12 @@ import {
   Get,
   Param,
   Patch,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import type { Profile } from '@prisma/client';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
+import { WorkspacePageParamDto } from '../../common/dto/route-params.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PageAccess } from '../../common/decorators/page-access.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -23,21 +26,27 @@ export class PageAccessRequestsController {
   constructor(private readonly pageSharesService: PageSharesService) {}
 
   @Get()
-  list(@Param('workspaceId') workspaceId: string, @Param('pageId') pageId: string) {
-    return this.pageSharesService.listAccessRequests(workspaceId, pageId);
+  list(
+    @Param() params: WorkspacePageParamDto,
+    @Query() query: PaginationQueryDto,
+  ) {
+    return this.pageSharesService.listAccessRequests(
+      params.workspaceId,
+      params.pageId,
+      query,
+    );
   }
 
   @Patch(':requestId')
   handle(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @Param('requestId') requestId: string,
     @CurrentUser() user: Profile,
     @Body() dto: HandlePageAccessRequestDto,
   ) {
     return this.pageSharesService.handleAccessRequest(
-      workspaceId,
-      pageId,
+      params.workspaceId,
+      params.pageId,
       requestId,
       user,
       dto.action,

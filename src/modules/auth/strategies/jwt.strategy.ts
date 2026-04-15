@@ -10,6 +10,7 @@ type SupabaseJwtPayload = {
   email?: string;
   user_metadata?: {
     name?: string;
+    full_name?: string;
   };
 };
 
@@ -179,15 +180,28 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Invalid token payload');
     }
 
-    const email = payload.email ?? '';
+    const normalizedEmail = payload.email?.trim().toLowerCase();
+    const rawName = payload.user_metadata?.name ?? payload.user_metadata?.full_name;
+    const normalizedName = rawName?.trim();
+    const resolvedEmail =
+      normalizedEmail && normalizedEmail.length > 0
+        ? normalizedEmail
+        : `${id}@users.meanlok.local`;
+    const resolvedName =
+      normalizedName && normalizedName.length > 0
+        ? normalizedName
+        : resolvedEmail.split('@')[0] || 'user';
 
     const profile = await this.prisma.profile.upsert({
       where: { id },
-      update: {},
+      update: {
+        ...(normalizedEmail ? { email: normalizedEmail } : {}),
+        ...(normalizedName ? { name: normalizedName } : {}),
+      },
       create: {
         id,
-        email,
-        name: email.split('@')[0] || 'user',
+        email: resolvedEmail,
+        name: resolvedName,
       },
     });
 

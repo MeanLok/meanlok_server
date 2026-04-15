@@ -11,6 +11,7 @@ import {
   type Profile,
 } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AcceptPageInviteDto } from './dto/accept-page-invite.dto';
@@ -440,10 +441,20 @@ export class PageSharesService {
     return { ok: true };
   }
 
-  async listPendingInvites(workspaceId: string, pageId: string) {
+  async listPendingInvites(
+    workspaceId: string,
+    pageId: string,
+    query: PaginationQueryDto,
+  ) {
     await this.getPageOrThrow(workspaceId, pageId);
 
-    const invites = await this.prisma.pageInvite.findMany({
+    const offset = Math.max(0, Number(query.offset ?? 0));
+    const requestedLimit = Number(query.limit ?? 100);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(200, Math.max(1, Math.trunc(requestedLimit)))
+      : 100;
+
+    const chunk = await this.prisma.pageInvite.findMany({
       where: {
         pageId,
         acceptedAt: null,
@@ -463,15 +474,33 @@ export class PageSharesService {
       orderBy: {
         createdAt: 'desc',
       },
+      skip: offset,
+      take: limit + 1,
     });
 
-    return invites.map((invite) => this.toInviteOutput(invite));
+    const hasMore = chunk.length > limit;
+    const invites = hasMore ? chunk.slice(0, limit) : chunk;
+
+    return {
+      items: invites.map((invite) => this.toInviteOutput(invite)),
+      nextOffset: hasMore ? offset + limit : null,
+    };
   }
 
-  async listAccessRequests(workspaceId: string, pageId: string) {
+  async listAccessRequests(
+    workspaceId: string,
+    pageId: string,
+    query: PaginationQueryDto,
+  ) {
     await this.getPageOrThrow(workspaceId, pageId);
 
-    const requests = await this.prisma.pageAccessRequest.findMany({
+    const offset = Math.max(0, Number(query.offset ?? 0));
+    const requestedLimit = Number(query.limit ?? 100);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(200, Math.max(1, Math.trunc(requestedLimit)))
+      : 100;
+
+    const chunk = await this.prisma.pageAccessRequest.findMany({
       where: {
         pageId,
         status: PageAccessRequestStatus.PENDING,
@@ -488,9 +517,17 @@ export class PageSharesService {
       orderBy: {
         createdAt: 'asc',
       },
+      skip: offset,
+      take: limit + 1,
     });
 
-    return requests.map((request) => this.accessRequestOutput(request));
+    const hasMore = chunk.length > limit;
+    const requests = hasMore ? chunk.slice(0, limit) : chunk;
+
+    return {
+      items: requests.map((request) => this.accessRequestOutput(request)),
+      nextOffset: hasMore ? offset + limit : null,
+    };
   }
 
   async handleAccessRequest(

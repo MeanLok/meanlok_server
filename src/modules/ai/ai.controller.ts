@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
-import { Throttle } from '@nestjs/throttler';
+import { SkipThrottle } from '@nestjs/throttler';
 import type { Profile } from '@prisma/client';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -17,7 +17,7 @@ export class AiController {
   }
 
   @Post('ask')
-  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @SkipThrottle()
   ask(@CurrentUser() user: Profile, @Body() dto: AskDto) {
     return this.aiService.ask(user.id, dto.question);
   }

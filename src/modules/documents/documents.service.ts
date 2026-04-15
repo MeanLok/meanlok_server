@@ -9,15 +9,19 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { DocFormat, type Profile } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { unlink } from 'node:fs/promises';
 import { RuntimeMetricsService } from '../../common/observability/runtime-metrics.service';
 import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { AccessService } from '../../common/services/access.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { SanitizeService } from '../../shared/sanitize/sanitize.service';
+import { resolveUploadMaxImageBytes } from '../../shared/uploads/upload.constants';
 import { UpsertDocumentDto } from './dto/upsert-document.dto';
 
 type UploadedImageFile = {
-  buffer: Buffer;
+  buffer?: Buffer;
+  path?: string;
   mimetype: string;
   size: number;
   originalname?: string;
@@ -59,10 +63,9 @@ export class DocumentsService {
       ? Math.max(1_000, Math.trunc(configured))
       : 200_000;
 
-    const imageBytes = Number(this.configService.get('UPLOAD_MAX_IMAGE_BYTES') ?? 5 * 1024 * 1024);
-    this.maxImageBytes = Number.isFinite(imageBytes)
-      ? Math.max(100 * 1024, Math.trunc(imageBytes))
-      : 5 * 1024 * 1024;
+    this.maxImageBytes = resolveUploadMaxImageBytes(
+      this.configService.get('UPLOAD_MAX_IMAGE_BYTES'),
+    );
 
     this.supabaseUrl = this.configService
       .get<string>('SUPABASE_URL')
@@ -122,30 +125,48 @@ export class DocumentsService {
       .join('/');
   }
 
-  private toSignedUrl(signedPath: string) {
+  private toPublicObjectUrl(objectPath: string) {
     if (!this.supabaseUrl) {
       throw new ServiceUnavailableException(
         'Supabase storage settings are not configured',
       );
     }
 
-    if (/^https?:\/\//i.test(signedPath)) {
-      return signedPath;
-    }
+    const encodedPath = this.encodedObjectPath(objectPath);
+    return `${this.supabaseUrl}/storage/v1/object/public/${encodeURIComponent(this.storageBucket)}/${encodedPath}`;
+  }
 
-    if (signedPath.startsWith('/storage/v1/')) {
-      return `${this.supabaseUrl}${signedPath}`;
-    }
-
-    if (signedPath.startsWith('/')) {
-      return `${this.supabaseUrl}/storage/v1${signedPath}`;
-    }
-
-    return `${this.supabaseUrl}/storage/v1/${signedPath}`;
+  private toDocumentImageRef(objectPath: string) {
+    return `meanlok-image://${encodeURIComponent(this.storageBucket)}/${this.encodedObjectPath(objectPath)}`;
   }
 
   private looksLikeJwtToken(value: string) {
     return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+  }
+
+  private async cleanupTempUploadFile(file: UploadedImageFile | undefined) {
+    if (!file?.path) {
+      return;
+    }
+    await unlink(file.path).catch(() => undefined);
+  }
+
+  private buildUploadBody(file: UploadedImageFile) {
+    if (file.path) {
+      return {
+        body: createReadStream(file.path) as unknown as BodyInit,
+        needsDuplex: true,
+      };
+    }
+
+    if (file.buffer) {
+      return {
+        body: new Uint8Array(file.buffer),
+        needsDuplex: false,
+      };
+    }
+
+    throw new BadRequestException('Image file is required');
   }
 
   private async fetchStorage(path: string, init?: RequestInit) {
@@ -179,7 +200,33 @@ export class DocumentsService {
       const bucketId = encodeURIComponent(this.storageBucket);
       const existing = await this.fetchStorage(`/storage/v1/bucket/${bucketId}`);
       if (existing.ok) {
-        await existing.arrayBuffer().catch(() => undefined);
+        const bucket = (await existing
+          .json()
+          .catch(() => null)) as { public?: boolean } | null;
+
+        if (bucket?.public === false) {
+          const updated = await this.fetchStorage(`/storage/v1/bucket/${bucketId}`, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              id: this.storageBucket,
+              name: this.storageBucket,
+              public: true,
+              file_size_limit: this.maxImageBytes,
+              allowed_mime_types: [...SUPPORTED_IMAGE_MIME_TYPES],
+            }),
+          });
+
+          if (!updated.ok) {
+            const text = await updated.text().catch(() => '');
+            throw new BadGatewayException(
+              `Failed to update storage bucket (${updated.status}): ${text || 'unknown error'}`,
+            );
+          }
+        }
+
         return;
       }
 
@@ -219,7 +266,7 @@ export class DocumentsService {
         body: JSON.stringify({
           id: this.storageBucket,
           name: this.storageBucket,
-          public: false,
+          public: true,
           file_size_limit: this.maxImageBytes,
           allowed_mime_types: [...SUPPORTED_IMAGE_MIME_TYPES],
         }),
@@ -262,117 +309,100 @@ export class DocumentsService {
     user: Profile,
     file: UploadedImageFile | undefined,
   ) {
-    const access = await this.accessService.assertPageAccess(user.id, pageId, 'EDITOR');
-    if (access.workspaceId !== workspaceId) {
-      throw new NotFoundException('Page not found');
-    }
+    try {
+      const access = await this.accessService.assertPageAccess(user.id, pageId, 'EDITOR');
+      if (access.workspaceId !== workspaceId) {
+        throw new NotFoundException('Page not found');
+      }
 
-    if (!file) {
-      throw new BadRequestException('Image file is required');
-    }
+      if (!file) {
+        throw new BadRequestException('Image file is required');
+      }
 
-    if (!SUPPORTED_IMAGE_MIME_TYPES.has(file.mimetype)) {
-      throw new BadRequestException({
-        message: '지원하지 않는 이미지 형식입니다.',
-        error: {
-          code: 'IMAGE_TYPE_NOT_ALLOWED',
-          allowed: [...SUPPORTED_IMAGE_MIME_TYPES],
-        },
-      });
-    }
+      if (!SUPPORTED_IMAGE_MIME_TYPES.has(file.mimetype)) {
+        throw new BadRequestException({
+          message: '지원하지 않는 이미지 형식입니다.',
+          error: {
+            code: 'IMAGE_TYPE_NOT_ALLOWED',
+            allowed: [...SUPPORTED_IMAGE_MIME_TYPES],
+          },
+        });
+      }
 
-    if (file.size > this.maxImageBytes) {
-      throw new BadRequestException({
-        message: `이미지 파일은 최대 ${this.maxImageBytes}바이트까지 업로드할 수 있어요.`,
-        error: {
-          code: 'IMAGE_TOO_LARGE',
-          maxBytes: this.maxImageBytes,
-          currentBytes: file.size,
-        },
-      });
-    }
+      if (file.size > this.maxImageBytes) {
+        throw new BadRequestException({
+          message: `이미지 파일은 최대 ${this.maxImageBytes}바이트까지 업로드할 수 있어요.`,
+          error: {
+            code: 'IMAGE_TOO_LARGE',
+            maxBytes: this.maxImageBytes,
+            currentBytes: file.size,
+          },
+        });
+      }
 
-    await this.ensureBucketExists();
+      await this.ensureBucketExists();
 
-    const extension = MIME_TO_EXTENSION[file.mimetype] ?? 'bin';
-    const objectPath = [
-      `workspace-${workspaceId}`,
-      `page-${pageId}`,
-      `${Date.now()}-${randomBytes(8).toString('hex')}.${extension}`,
-    ].join('/');
-    const encodedPath = this.encodedObjectPath(objectPath);
+      const extension = MIME_TO_EXTENSION[file.mimetype] ?? 'bin';
+      const objectPath = [
+        `workspace-${workspaceId}`,
+        `page-${pageId}`,
+        `${Date.now()}-${randomBytes(8).toString('hex')}.${extension}`,
+      ].join('/');
+      const encodedPath = this.encodedObjectPath(objectPath);
 
-    const response = await this.fetchStorage(
-      `/storage/v1/object/${encodeURIComponent(this.storageBucket)}/${encodedPath}`,
-      {
+      const uploadBody = this.buildUploadBody(file);
+      const uploadInit: RequestInit & { duplex?: 'half' } = {
         method: 'POST',
         headers: {
           'Content-Type': file.mimetype,
           'x-upsert': 'false',
         },
-        body: new Uint8Array(file.buffer),
-      },
-    );
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      const isAuthFailure =
-        response.status === 401 ||
-        response.status === 403 ||
-        /signature verification failed|unauthorized/i.test(text);
-
-      if (isAuthFailure) {
-        throw new ServiceUnavailableException({
-          message:
-            'Supabase Storage 업로드 인증에 실패했어요. service role 키를 확인해 주세요.',
-          error: {
-            code: 'STORAGE_AUTH_FAILED',
-            statusCode: response.status,
-            details: text || null,
-          },
-        });
+        body: uploadBody.body,
+      };
+      if (uploadBody.needsDuplex) {
+        uploadInit.duplex = 'half';
       }
 
-      throw new BadGatewayException(
-        `Image upload failed (${response.status}): ${text || 'unknown error'}`,
+      const response = await this.fetchStorage(
+        `/storage/v1/object/${encodeURIComponent(this.storageBucket)}/${encodedPath}`,
+        uploadInit,
       );
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        const isAuthFailure =
+          response.status === 401 ||
+          response.status === 403 ||
+          /signature verification failed|unauthorized/i.test(text);
+
+        if (isAuthFailure) {
+          throw new ServiceUnavailableException({
+            message:
+              'Supabase Storage 업로드 인증에 실패했어요. service role 키를 확인해 주세요.',
+            error: {
+              code: 'STORAGE_AUTH_FAILED',
+              statusCode: response.status,
+              details: text || null,
+            },
+          });
+        }
+
+        throw new BadGatewayException(
+          `Image upload failed (${response.status}): ${text || 'unknown error'}`,
+        );
+      }
+
+      return {
+        url: this.toPublicObjectUrl(objectPath),
+        ref: this.toDocumentImageRef(objectPath),
+        path: objectPath,
+        bucket: this.storageBucket,
+        contentType: file.mimetype,
+        size: file.size,
+      };
+    } finally {
+      await this.cleanupTempUploadFile(file);
     }
-
-    const signedUrlResponse = await this.fetchStorage(
-      `/storage/v1/object/sign/${encodeURIComponent(this.storageBucket)}/${encodedPath}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          expiresIn: 3600,
-        }),
-      },
-    );
-
-    if (!signedUrlResponse.ok) {
-      const text = await signedUrlResponse.text().catch(() => '');
-      throw new BadGatewayException(
-        `Failed to create signed image URL (${signedUrlResponse.status}): ${text || 'unknown error'}`,
-      );
-    }
-
-    const signedPayload = (await signedUrlResponse
-      .json()
-      .catch(() => null)) as { signedURL?: string; signedUrl?: string } | null;
-    const signedPath = signedPayload?.signedURL ?? signedPayload?.signedUrl;
-    if (!signedPath) {
-      throw new BadGatewayException('Failed to create signed image URL');
-    }
-
-    return {
-      url: this.toSignedUrl(signedPath),
-      path: objectPath,
-      bucket: this.storageBucket,
-      contentType: file.mimetype,
-      size: file.size,
-    };
   }
 
   async upsert(
