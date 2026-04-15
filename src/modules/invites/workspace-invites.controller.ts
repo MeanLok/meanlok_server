@@ -5,9 +5,12 @@ import {
   Get,
   Param,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { Role, type Profile } from '@prisma/client';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
+import { WorkspaceParamDto } from '../../common/dto/route-params.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { WorkspaceRole } from '../../common/decorators/workspace-role.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -23,23 +26,26 @@ export class WorkspaceInvitesController {
 
   @Post()
   create(
-    @Param('workspaceId') workspaceId: string,
+    @Param() params: WorkspaceParamDto,
     @CurrentUser() user: Profile,
     @Body() dto: CreateInviteDto,
   ) {
-    return this.invitesService.create(workspaceId, user, dto);
+    return this.invitesService.create(params.workspaceId, user, dto);
   }
 
   @Get()
-  findPending(@Param('workspaceId') workspaceId: string) {
-    return this.invitesService.findPending(workspaceId);
+  findPending(
+    @Param() params: WorkspaceParamDto,
+    @Query() query: PaginationQueryDto,
+  ) {
+    return this.invitesService.findPending(params.workspaceId, query);
   }
 
   @Delete(':inviteId')
   remove(
-    @Param('workspaceId') workspaceId: string,
+    @Param() params: WorkspaceParamDto,
     @Param('inviteId') inviteId: string,
   ) {
-    return this.invitesService.remove(workspaceId, inviteId);
+    return this.invitesService.remove(params.workspaceId, inviteId);
   }
 }

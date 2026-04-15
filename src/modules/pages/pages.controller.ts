@@ -6,10 +6,16 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
 import type { Profile } from '@prisma/client';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
+import {
+  WorkspacePageParamDto,
+  WorkspaceParamDto,
+} from '../../common/dto/route-params.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PageAccess } from '../../common/decorators/page-access.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -27,27 +33,32 @@ export class PagesController {
 
   @Post()
   create(
-    @Param('workspaceId') workspaceId: string,
+    @Param() params: WorkspaceParamDto,
     @CurrentUser() user: Profile,
     @Body() dto: CreatePageDto,
   ) {
-    return this.pagesService.create(workspaceId, user, dto);
+    return this.pagesService.create(params.workspaceId, user, dto);
   }
 
   @Get()
-  findAll(@Param('workspaceId') workspaceId: string, @CurrentUser() user: Profile) {
-    return this.pagesService.findAll(workspaceId, user);
+  findAll(
+    @Param() params: WorkspaceParamDto,
+    @CurrentUser() user: Profile,
+    @Query() query: PaginationQueryDto,
+  ) {
+    return this.pagesService.findAll(params.workspaceId, user, query);
   }
 
   @UseGuards(PageAccessGuard)
   @PageAccess('VIEWER')
   @Get(':pageId/meta')
   findMeta(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @Req() request: any,
   ) {
-    return this.pagesService.findMeta(workspaceId, pageId).then((page) => ({
+    return this.pagesService
+      .findMeta(params.workspaceId, params.pageId)
+      .then((page) => ({
       ...page,
       accessRole: request.pageAccess?.role ?? 'VIEWER',
     }));
@@ -57,11 +68,12 @@ export class PagesController {
   @PageAccess('VIEWER')
   @Get(':pageId')
   findOne(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @Req() request: any,
   ) {
-    return this.pagesService.findOne(workspaceId, pageId).then((page) => ({
+    return this.pagesService
+      .findOne(params.workspaceId, params.pageId)
+      .then((page) => ({
       ...page,
       accessRole: request.pageAccess?.role ?? 'VIEWER',
     }));
@@ -71,44 +83,40 @@ export class PagesController {
   @PageAccess('EDITOR')
   @Patch(':pageId')
   update(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @Body() dto: UpdatePageDto,
   ) {
-    return this.pagesService.update(workspaceId, pageId, dto);
+    return this.pagesService.update(params.workspaceId, params.pageId, dto);
   }
 
   @UseGuards(PageAccessGuard)
   @PageAccess('EDITOR')
   @Delete(':pageId')
   remove(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
   ) {
-    return this.pagesService.remove(workspaceId, pageId);
+    return this.pagesService.remove(params.workspaceId, params.pageId);
   }
 
   @UseGuards(PageAccessGuard)
   @PageAccess('EDITOR')
   @Post(':pageId/duplicate')
   duplicate(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @CurrentUser() user: Profile,
     @Body() dto: DuplicatePageDto,
   ) {
-    return this.pagesService.duplicate(workspaceId, pageId, user, dto);
+    return this.pagesService.duplicate(params.workspaceId, params.pageId, user, dto);
   }
 
   @UseGuards(PageAccessGuard)
   @PageAccess('EDITOR')
   @Post(':pageId/move')
   move(
-    @Param('workspaceId') workspaceId: string,
-    @Param('pageId') pageId: string,
+    @Param() params: WorkspacePageParamDto,
     @CurrentUser() user: Profile,
     @Body() dto: MovePageDto,
   ) {
-    return this.pagesService.move(workspaceId, pageId, user, dto);
+    return this.pagesService.move(params.workspaceId, params.pageId, user, dto);
   }
 }

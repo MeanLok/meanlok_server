@@ -1,9 +1,16 @@
 import { PageRole } from '@prisma/client';
-import { IsEmail, IsEnum, IsOptional, IsString } from 'class-validator';
+import {
+  IsEmail,
+  IsEnum,
+  IsOptional,
+  IsString,
+  IsUUID,
+} from 'class-validator';
 
 export class CreatePageShareDto {
   @IsOptional()
   @IsString()
+  @IsUUID()
   userId?: string;
 
   @IsOptional()

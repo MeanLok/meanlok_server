@@ -8,9 +8,10 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { RuntimeMetricsService } from '../../common/observability/runtime-metrics.service';
 import { PrismaService } from '../../prisma/prisma.service';
+import { AiRedisRestService } from './ai-redis-rest.service';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -32,12 +33,25 @@ export interface AiUsageSummary {
   resetAt: string;
 }
 
+interface CachedAnswer {
+  result: string;
+  expiresAt: number;
+}
+
 @Injectable()
 export class AiService {
-  // 단일 노드 한정 in-memory 쿨다운 저장소.
+  // Redis 미설정 시 단일 노드 fallback 저장소.
   private readonly lastRequestAtByUser = new Map<string, number>();
+  private readonly localRequestCountByWindow = new Map<string, number>();
+  private readonly cachedAnswerByUserQuestion = new Map<string, CachedAnswer>();
   private readonly dailyRequestLimit: number;
   private readonly maxQuestionChars: number;
+  private readonly maxResponseTokens: number;
+  private readonly questionCacheTtlMs: number;
+  private readonly estimatedTokensPerRequest: number;
+  private readonly dailyEstimatedTokenBudget: number;
+  private readonly rateLimitWindowSec: number;
+  private readonly rateLimitMaxRequests: number;
   private readonly requestCooldownMs: number;
   private readonly quotaTimezoneOffsetMinutes: number;
 
@@ -45,9 +59,37 @@ export class AiService {
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly metrics: RuntimeMetricsService,
+    private readonly redis: AiRedisRestService,
   ) {
     this.dailyRequestLimit = this.readNumericConfig('AI_DAILY_REQUEST_LIMIT', 20, 1);
     this.maxQuestionChars = this.readNumericConfig('AI_MAX_QUESTION_CHARS', 2000, 100);
+    this.maxResponseTokens = this.readNumericConfig('AI_MAX_RESPONSE_TOKENS', 512, 64, 4096);
+    this.questionCacheTtlMs =
+      this.readNumericConfig('AI_QUESTION_CACHE_TTL_SEC', 30, 0, 600) * 1000;
+    this.estimatedTokensPerRequest = this.readNumericConfig(
+      'AI_ESTIMATED_TOKENS_PER_REQUEST',
+      700,
+      50,
+      8000,
+    );
+    this.dailyEstimatedTokenBudget = this.readNumericConfig(
+      'AI_DAILY_TOKEN_BUDGET',
+      20_000,
+      0,
+      5_000_000,
+    );
+    this.rateLimitWindowSec = this.readNumericConfig(
+      'AI_RATE_LIMIT_WINDOW_SEC',
+      60,
+      1,
+      3_600,
+    );
+    this.rateLimitMaxRequests = this.readNumericConfig(
+      'AI_RATE_LIMIT_MAX_REQUESTS',
+      10,
+      1,
+      10_000,
+    );
     this.requestCooldownMs =
       this.readNumericConfig('AI_REQUEST_COOLDOWN_SEC', 12, 0) * 1000;
     this.quotaTimezoneOffsetMinutes = this.readNumericConfig(
@@ -111,6 +153,104 @@ export class AiService {
       remainingToday: Math.max(0, this.dailyRequestLimit - usedToday),
       resetAt,
     };
+  }
+
+  private normalizeQuestionForCache(question: string) {
+    return question.trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  private questionCacheKey(userId: string, question: string) {
+    const normalized = this.normalizeQuestionForCache(question);
+    const hash = createHash('sha1').update(normalized).digest('hex');
+    return `ai:answer:${userId}:${hash}`;
+  }
+
+  private windowRateLimitKey(userId: string, nowMs: number) {
+    const windowId = Math.floor(nowMs / (this.rateLimitWindowSec * 1000));
+    return `ai:ratelimit:${userId}:${windowId}`;
+  }
+
+  private cooldownKey(userId: string) {
+    return `ai:cooldown:${userId}`;
+  }
+
+  private pruneInMemoryState(now = Date.now()) {
+    for (const [key, value] of this.cachedAnswerByUserQuestion.entries()) {
+      if (value.expiresAt <= now) {
+        this.cachedAnswerByUserQuestion.delete(key);
+      }
+    }
+
+    if (this.requestCooldownMs <= 0) {
+      this.lastRequestAtByUser.clear();
+      return;
+    }
+
+    const staleThreshold = now - Math.max(this.requestCooldownMs * 5, 60_000);
+    for (const [key, lastRequestAt] of this.lastRequestAtByUser.entries()) {
+      if (lastRequestAt < staleThreshold) {
+        this.lastRequestAtByUser.delete(key);
+      }
+    }
+
+    const windowRetentionMs = Math.max(this.rateLimitWindowSec * 3 * 1000, 120_000);
+    for (const key of this.localRequestCountByWindow.keys()) {
+      const keyParts = key.split(':');
+      const windowIdRaw = keyParts[keyParts.length - 1];
+      const windowId = Number(windowIdRaw);
+      if (!Number.isFinite(windowId)) {
+        this.localRequestCountByWindow.delete(key);
+        continue;
+      }
+
+      const windowStartMs = windowId * this.rateLimitWindowSec * 1000;
+      if (windowStartMs + windowRetentionMs < now) {
+        this.localRequestCountByWindow.delete(key);
+      }
+    }
+  }
+
+  private async getCachedAnswer(userId: string, question: string) {
+    if (this.questionCacheTtlMs <= 0) {
+      return null;
+    }
+
+    const cacheKey = this.questionCacheKey(userId, question);
+    if (this.redis.isEnabled()) {
+      const cachedValue = await this.redis.get(cacheKey);
+      if (typeof cachedValue === 'string' && cachedValue) {
+        return cachedValue;
+      }
+    }
+
+    this.pruneInMemoryState();
+    const cached = this.cachedAnswerByUserQuestion.get(cacheKey);
+    if (!cached || cached.expiresAt <= Date.now()) {
+      if (cached) {
+        this.cachedAnswerByUserQuestion.delete(cacheKey);
+      }
+      return null;
+    }
+
+    return cached.result;
+  }
+
+  private async setCachedAnswer(userId: string, question: string, result: string) {
+    if (this.questionCacheTtlMs <= 0 || !result) {
+      return;
+    }
+
+    const cacheKey = this.questionCacheKey(userId, question);
+    if (this.redis.isEnabled()) {
+      await this.redis.setEx(cacheKey, result, Math.ceil(this.questionCacheTtlMs / 1000));
+    }
+
+    const now = Date.now();
+    this.pruneInMemoryState(now);
+    this.cachedAnswerByUserQuestion.set(cacheKey, {
+      result,
+      expiresAt: now + this.questionCacheTtlMs,
+    });
   }
 
   async getUsage(userId: string): Promise<AiUsageSummary> {
@@ -272,6 +412,76 @@ export class AiService {
     );
   }
 
+  private async enforceRateLimit(userId: string) {
+    const now = Date.now();
+    this.pruneInMemoryState(now);
+
+    if (this.redis.isEnabled()) {
+      const key = this.windowRateLimitKey(userId, now);
+      const count = await this.redis.incr(key);
+      if (count !== null) {
+        if (count === 1) {
+          await this.redis.expire(key, this.rateLimitWindowSec + 1);
+        }
+
+        if (count > this.rateLimitMaxRequests) {
+          const ttlSec = await this.redis.ttl(key);
+          this.throwRateLimited(ttlSec ?? this.rateLimitWindowSec);
+        }
+        return;
+      }
+    }
+
+    const localKey = this.windowRateLimitKey(userId, now);
+    const nextCount = (this.localRequestCountByWindow.get(localKey) ?? 0) + 1;
+    this.localRequestCountByWindow.set(localKey, nextCount);
+    if (nextCount > this.rateLimitMaxRequests) {
+      this.throwRateLimited(this.rateLimitWindowSec);
+    }
+  }
+
+  private async enforceCooldown(userId: string) {
+    if (this.requestCooldownMs <= 0) {
+      return;
+    }
+
+    const now = Date.now();
+    const cooldownSec = Math.max(1, Math.ceil(this.requestCooldownMs / 1000));
+
+    if (this.redis.isEnabled()) {
+      const key = this.cooldownKey(userId);
+      const locked = await this.redis.setNxEx(key, String(now), cooldownSec);
+      if (!locked) {
+        const ttlSec = await this.redis.ttl(key);
+        this.throwRateLimited(ttlSec ?? cooldownSec);
+      }
+      return;
+    }
+
+    const lastRequestAt = this.lastRequestAtByUser.get(userId);
+    if (lastRequestAt) {
+      const elapsedMs = now - lastRequestAt;
+      if (elapsedMs < this.requestCooldownMs) {
+        const retryAfterSec = Math.max(
+          1,
+          Math.ceil((this.requestCooldownMs - elapsedMs) / 1000),
+        );
+        this.throwRateLimited(retryAfterSec);
+      }
+    }
+
+    this.lastRequestAtByUser.set(userId, now);
+  }
+
+  private exceedsDailyTokenBudget(usedToday: number) {
+    if (this.dailyEstimatedTokenBudget <= 0) {
+      return false;
+    }
+
+    const estimatedUsedTokens = usedToday * this.estimatedTokensPerRequest;
+    return estimatedUsedTokens >= this.dailyEstimatedTokenBudget;
+  }
+
   private extractErrorCode(error: unknown): string | null {
     if (!(error instanceof HttpException)) {
       return 'UNKNOWN';
@@ -399,6 +609,7 @@ export class AiService {
         body: JSON.stringify({
           model,
           temperature: 0.2,
+          max_tokens: this.maxResponseTokens,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
@@ -466,29 +677,29 @@ export class AiService {
     }
 
     try {
+      const cachedResult = await this.getCachedAnswer(userId, trimmedQuestion);
+      if (cachedResult) {
+        const usage = await this.getUsage(userId);
+        success = true;
+        return {
+          result: cachedResult,
+          usage,
+        };
+      }
+
       const usage = await this.getUsage(userId);
       if (usage.remainingToday <= 0) {
         const { retryAfterSec } = this.getUsageWindow();
         this.throwQuotaExceeded(usage, retryAfterSec);
       }
 
-      if (this.requestCooldownMs > 0) {
-        const now = Date.now();
-        const lastRequestAt = this.lastRequestAtByUser.get(userId);
-
-        if (lastRequestAt) {
-          const elapsedMs = now - lastRequestAt;
-          if (elapsedMs < this.requestCooldownMs) {
-            const retryAfterSec = Math.max(
-              1,
-              Math.ceil((this.requestCooldownMs - elapsedMs) / 1000),
-            );
-            this.throwRateLimited(retryAfterSec);
-          }
-        }
-
-        this.lastRequestAtByUser.set(userId, now);
+      if (this.exceedsDailyTokenBudget(usage.usedToday)) {
+        const { retryAfterSec } = this.getUsageWindow();
+        this.throwQuotaExceeded(usage, retryAfterSec);
       }
+
+      await this.enforceRateLimit(userId);
+      await this.enforceCooldown(userId);
 
       const result = await this.generate(
         '너는 한국어 문서 협업 도구의 AI 도우미다. 사용자의 질문에 정확하고 실용적으로 답하라. 모르면 모른다고 말하라.',
@@ -496,6 +707,7 @@ export class AiService {
       );
 
       const nextUsage = await this.increaseUsage(userId);
+      await this.setCachedAnswer(userId, trimmedQuestion, result);
       success = true;
 
       return {

@@ -1,3 +1,5 @@
+import { resolveUploadMaxImageBytes } from '../shared/uploads/upload.constants';
+
 export default () => ({
   DATABASE_URL: process.env.DATABASE_URL,
   DIRECT_URL: process.env.DIRECT_URL,
@@ -12,6 +14,10 @@ export default () => ({
   GROQ_BASE_URL: process.env.GROQ_BASE_URL,
   AI_DAILY_REQUEST_LIMIT: process.env.AI_DAILY_REQUEST_LIMIT ?? '20',
   AI_MAX_QUESTION_CHARS: process.env.AI_MAX_QUESTION_CHARS ?? '2000',
+  AI_MAX_RESPONSE_TOKENS: process.env.AI_MAX_RESPONSE_TOKENS ?? '512',
+  AI_QUESTION_CACHE_TTL_SEC: process.env.AI_QUESTION_CACHE_TTL_SEC ?? '30',
+  AI_ESTIMATED_TOKENS_PER_REQUEST: process.env.AI_ESTIMATED_TOKENS_PER_REQUEST ?? '700',
+  AI_DAILY_TOKEN_BUDGET: process.env.AI_DAILY_TOKEN_BUDGET ?? '20000',
   AI_REQUEST_COOLDOWN_SEC: process.env.AI_REQUEST_COOLDOWN_SEC ?? '12',
   AI_RESET_TIMEZONE_OFFSET_MINUTES: process.env.AI_RESET_TIMEZONE_OFFSET_MINUTES ?? '540',
   MAINTENANCE_ENABLED: process.env.MAINTENANCE_ENABLED ?? 'true',
@@ -24,7 +30,13 @@ export default () => ({
   ACCESS_CACHE_TTL_MS: process.env.ACCESS_CACHE_TTL_MS ?? '5000',
   PAGE_CACHE_TTL_MS: process.env.PAGE_CACHE_TTL_MS ?? '10000',
   METRICS_WINDOW_MINUTES: process.env.METRICS_WINDOW_MINUTES ?? '60',
-  UPLOAD_MAX_IMAGE_BYTES: process.env.UPLOAD_MAX_IMAGE_BYTES ?? '5242880',
+  UPLOAD_MAX_IMAGE_BYTES: String(
+    resolveUploadMaxImageBytes(process.env.UPLOAD_MAX_IMAGE_BYTES),
+  ),
+  AI_REDIS_REST_URL: process.env.AI_REDIS_REST_URL,
+  AI_REDIS_REST_TOKEN: process.env.AI_REDIS_REST_TOKEN,
+  AI_RATE_LIMIT_WINDOW_SEC: process.env.AI_RATE_LIMIT_WINDOW_SEC ?? '60',
+  AI_RATE_LIMIT_MAX_REQUESTS: process.env.AI_RATE_LIMIT_MAX_REQUESTS ?? '10',
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
   adminEmails: (process.env.ADMIN_EMAILS ?? '')
     .split(',')

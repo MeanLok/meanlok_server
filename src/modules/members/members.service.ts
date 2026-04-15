@@ -1,5 +1,6 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { Role } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { UpdateMemberDto } from './dto/update-member.dto';
@@ -11,8 +12,14 @@ export class MembersService {
     private readonly runtimeCache: RuntimeCacheService,
   ) {}
 
-  async findAll(workspaceId: string) {
-    return this.prisma.workspaceMember.findMany({
+  async findAll(workspaceId: string, query: PaginationQueryDto) {
+    const offset = Math.max(0, Number(query.offset ?? 0));
+    const requestedLimit = Number(query.limit ?? 100);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(200, Math.max(1, Math.trunc(requestedLimit)))
+      : 100;
+
+    const chunk = await this.prisma.workspaceMember.findMany({
       where: { workspaceId },
       include: {
         user: {
@@ -23,8 +30,18 @@ export class MembersService {
           },
         },
       },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      skip: offset,
+      take: limit + 1,
     });
+
+    const hasMore = chunk.length > limit;
+    const members = hasMore ? chunk.slice(0, limit) : chunk;
+
+    return {
+      items: members,
+      nextOffset: hasMore ? offset + limit : null,
+    };
   }
 
   async update(workspaceId: string, memberId: string, dto: UpdateMemberDto) {

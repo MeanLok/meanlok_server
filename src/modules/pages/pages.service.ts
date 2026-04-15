@@ -13,6 +13,7 @@ import {
   type PrismaClient,
 } from '@prisma/client';
 import { AccessService } from '../../common/services/access.service';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
@@ -32,6 +33,9 @@ const WORKSPACE_EDITOR_PRIORITY: Record<Role, number> = {
   [Role.EDITOR]: 2,
   [Role.VIEWER]: 1,
 };
+
+const DEFAULT_PAGE_LIST_LIMIT = 120;
+const MAX_PAGE_LIST_LIMIT = 200;
 
 @Injectable()
 export class PagesService {
@@ -149,13 +153,21 @@ export class PagesService {
     return created;
   }
 
-  async findAll(workspaceId: string, user: Profile) {
+  async findAll(workspaceId: string, user: Profile, query: PaginationQueryDto) {
+    const offset = Math.max(0, Number(query.offset ?? 0));
+    const requestedLimit = Number(query.limit ?? DEFAULT_PAGE_LIST_LIMIT);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(MAX_PAGE_LIST_LIMIT, Math.max(1, Math.trunc(requestedLimit)))
+      : DEFAULT_PAGE_LIST_LIMIT;
+
     const workspaceRevision = this.runtimeCache.getWorkspaceRevision(workspaceId);
     const cacheKey = [
       'pages:list',
       `:ws:${workspaceId}:`,
       `wrev:${workspaceRevision}`,
       `u:${user.id}`,
+      `offset:${offset}`,
+      `limit:${limit}`,
     ].join(':');
 
     return this.runtimeCache.getOrSet(
@@ -164,7 +176,7 @@ export class PagesService {
         const memberRole = await this.accessService.getWorkspaceMemberRole(user.id, workspaceId);
 
         if (memberRole) {
-          const pages = await this.prisma.page.findMany({
+          const chunk = await this.prisma.page.findMany({
             where: { workspaceId },
             select: {
               id: true,
@@ -173,13 +185,18 @@ export class PagesService {
               order: true,
               icon: true,
             },
-            orderBy: { order: 'asc' },
+            orderBy: [{ order: 'asc' }, { id: 'asc' }],
+            skip: offset,
+            take: limit + 1,
           });
+          const hasMore = chunk.length > limit;
+          const pages = hasMore ? chunk.slice(0, limit) : chunk;
 
           return {
             pages,
             viewerRole: 'MEMBER' as const,
             memberRole,
+            nextOffset: hasMore ? offset + limit : null,
           };
         }
 
@@ -197,7 +214,7 @@ export class PagesService {
           rootShareIds,
         );
 
-        const pages = await this.prisma.page.findMany({
+        const chunk = await this.prisma.page.findMany({
           where: {
             workspaceId,
             id: {
@@ -211,13 +228,18 @@ export class PagesService {
             order: true,
             icon: true,
           },
-          orderBy: { order: 'asc' },
+          orderBy: [{ order: 'asc' }, { id: 'asc' }],
+          skip: offset,
+          take: limit + 1,
         });
+        const hasMore = chunk.length > limit;
+        const pages = hasMore ? chunk.slice(0, limit) : chunk;
 
         return {
           pages,
           viewerRole: 'GUEST' as const,
           memberRole: null,
+          nextOffset: hasMore ? offset + limit : null,
         };
       },
       this.pageCacheTtlMs,
@@ -372,6 +394,12 @@ export class PagesService {
 
     const targetWorkspaceId = dto.targetWorkspaceId ?? workspaceId;
     const targetParentId = dto.targetParentId;
+
+    if (targetWorkspaceId !== workspaceId && !sourceAccess.viaMember) {
+      throw new ForbiddenException(
+        'Workspace membership is required to duplicate pages across workspaces',
+      );
+    }
 
     await this.assertEditableTarget(user.id, targetWorkspaceId, targetParentId);
 

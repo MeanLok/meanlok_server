@@ -1,4 +1,12 @@
-import { IsNotEmpty, IsOptional, IsString, MaxLength } from 'class-validator';
+import {
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  Matches,
+  MaxLength,
+} from 'class-validator';
+
+const CUID_PATTERN = /^c[a-z0-9]{20,}$/i;
 
 export class CreatePageDto {
   @IsString()
@@ -8,6 +16,7 @@ export class CreatePageDto {
 
   @IsOptional()
   @IsString()
+  @Matches(CUID_PATTERN)
   parentId?: string | null;
 
   @IsOptional()
