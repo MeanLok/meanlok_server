@@ -3,9 +3,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PageRole, Role } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
-import { collectDescendantIds } from '../../shared/tree/tree.util';
+import { RuntimeCacheService } from '../runtime-cache/runtime-cache.service';
 
 export type EffectivePageRole = 'EDITOR' | 'VIEWER' | null;
 
@@ -40,22 +41,78 @@ function maxRole(a: EffectivePageRole, b: EffectivePageRole): EffectivePageRole 
 
 @Injectable()
 export class AccessService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly accessCacheTtlMs: number;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly configService: ConfigService,
+    private readonly runtimeCache: RuntimeCacheService,
+  ) {
+    const configured = Number(this.configService.get('ACCESS_CACHE_TTL_MS') ?? 5_000);
+    this.accessCacheTtlMs = Number.isFinite(configured)
+      ? Math.max(250, Math.trunc(configured))
+      : 5_000;
+  }
+
+  private async listAncestorPageIds(pageId: string): Promise<string[]> {
+    const pageRevision = this.runtimeCache.getPageRevision(pageId);
+    const cacheKey = [
+      'access:ancestor-ids',
+      `:p:${pageId}:`,
+      `rev:${pageRevision}`,
+    ].join(':');
+
+    return this.runtimeCache.getOrSet(
+      cacheKey,
+      async () => {
+        const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+          WITH RECURSIVE ancestors AS (
+            SELECT id, "parentId"
+            FROM "Page"
+            WHERE id = ${pageId}
+            UNION ALL
+            SELECT p.id, p."parentId"
+            FROM "Page" p
+            INNER JOIN ancestors a ON a."parentId" = p.id
+          )
+          SELECT id
+          FROM ancestors
+        `;
+
+        return rows.map((row) => row.id);
+      },
+      this.accessCacheTtlMs,
+    );
+  }
 
   async getWorkspaceMemberRole(userId: string, workspaceId: string): Promise<Role | null> {
-    const membership = await this.prisma.workspaceMember.findUnique({
-      where: {
-        userId_workspaceId: {
-          userId,
-          workspaceId,
-        },
-      },
-      select: {
-        role: true,
-      },
-    });
+    const workspaceRevision = this.runtimeCache.getWorkspaceRevision(workspaceId);
+    const cacheKey = [
+      'access:workspace-member-role',
+      `:ws:${workspaceId}:`,
+      `rev:${workspaceRevision}`,
+      `u:${userId}`,
+    ].join(':');
 
-    return membership?.role ?? null;
+    return this.runtimeCache.getOrSet(
+      cacheKey,
+      async () => {
+        const membership = await this.prisma.workspaceMember.findUnique({
+          where: {
+            userId_workspaceId: {
+              userId,
+              workspaceId,
+            },
+          },
+          select: {
+            role: true,
+          },
+        });
+
+        return membership?.role ?? null;
+      },
+      this.accessCacheTtlMs,
+    );
   }
 
   async getEffectivePageRole(
@@ -67,64 +124,61 @@ export class AccessService {
       select: {
         id: true,
         workspaceId: true,
-        parentId: true,
       },
     });
 
     if (!page) {
       throw new NotFoundException('Page not found');
     }
+    const workspaceRevision = this.runtimeCache.getWorkspaceRevision(page.workspaceId);
+    const pageRevision = this.runtimeCache.getPageRevision(page.id);
+    const cacheKey = [
+      'access:effective-role',
+      `:ws:${page.workspaceId}:`,
+      `wrev:${workspaceRevision}`,
+      `:p:${page.id}:`,
+      `prev:${pageRevision}`,
+      `u:${userId}`,
+    ].join(':');
 
-    const ancestorIds = [page.id];
-    let currentParentId = page.parentId;
+    return this.runtimeCache.getOrSet(
+      cacheKey,
+      async () => {
+        const ancestorIds = await this.listAncestorPageIds(page.id);
 
-    while (currentParentId) {
-      const parent = await this.prisma.page.findUnique({
-        where: { id: currentParentId },
-        select: {
-          id: true,
-          parentId: true,
-        },
-      });
+        const pageShares = await this.prisma.pageShare.findMany({
+          where: {
+            userId,
+            pageId: {
+              in: ancestorIds,
+            },
+          },
+          select: {
+            role: true,
+          },
+        });
 
-      if (!parent) {
-        break;
-      }
+        const pageRole = pageShares.reduce<EffectivePageRole>((acc, share) => {
+          const current = share.role as PageRole;
+          const nextRole: EffectivePageRole = current === PageRole.EDITOR ? 'EDITOR' : 'VIEWER';
+          return maxRole(acc, nextRole);
+        }, null);
 
-      ancestorIds.push(parent.id);
-      currentParentId = parent.parentId;
-    }
+        const workspaceMemberRole = await this.getWorkspaceMemberRole(userId, page.workspaceId);
+        const workspaceRole = workspaceMemberRole
+          ? WORKSPACE_TO_PAGE_ROLE[workspaceMemberRole]
+          : null;
 
-    const pageShares = await this.prisma.pageShare.findMany({
-      where: {
-        userId,
-        pageId: {
-          in: ancestorIds,
-        },
+        const role = maxRole(workspaceRole, pageRole);
+
+        return {
+          role,
+          viaMember: toPriority(workspaceRole) >= toPriority(pageRole) && Boolean(workspaceRole),
+          workspaceId: page.workspaceId,
+        };
       },
-      select: {
-        role: true,
-      },
-    });
-
-    const pageRole = pageShares.reduce<EffectivePageRole>((acc, share) => {
-      const current = share.role as PageRole;
-      const nextRole: EffectivePageRole = current === PageRole.EDITOR ? 'EDITOR' : 'VIEWER';
-      return maxRole(acc, nextRole);
-    }, null);
-
-    const workspaceMemberRole = await this.getWorkspaceMemberRole(userId, page.workspaceId);
-    const workspaceRole = workspaceMemberRole
-      ? WORKSPACE_TO_PAGE_ROLE[workspaceMemberRole]
-      : null;
-
-    const role = maxRole(workspaceRole, pageRole);
-
-    return {
-      role,
-      viaMember: toPriority(workspaceRole) >= toPriority(pageRole) && Boolean(workspaceRole),
-      workspaceId: page.workspaceId,
-    };
+      this.accessCacheTtlMs,
+    );
   }
 
   async assertPageAccess(
@@ -147,22 +201,32 @@ export class AccessService {
   }
 
   async listAccessibleRootPageIds(userId: string, workspaceId: string): Promise<string[]> {
-    const shares = await this.prisma.pageShare.findMany({
-      where: {
-        userId,
-        page: {
-          workspaceId,
-        },
-      },
-      select: {
-        pageId: true,
-      },
-    });
+    const workspaceRevision = this.runtimeCache.getWorkspaceRevision(workspaceId);
+    const cacheKey = [
+      'access:root-pages',
+      `:ws:${workspaceId}:`,
+      `rev:${workspaceRevision}`,
+      `u:${userId}`,
+    ].join(':');
 
-    return shares.map((share) => share.pageId);
-  }
+    return this.runtimeCache.getOrSet(
+      cacheKey,
+      async () => {
+        const shares = await this.prisma.pageShare.findMany({
+          where: {
+            userId,
+            page: {
+              workspaceId,
+            },
+          },
+          select: {
+            pageId: true,
+          },
+        });
 
-  async collectDescendants(pageId: string): Promise<Set<string>> {
-    return collectDescendantIds(this.prisma, pageId);
+        return shares.map((share) => share.pageId);
+      },
+      this.accessCacheTtlMs,
+    );
   }
 }

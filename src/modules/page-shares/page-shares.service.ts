@@ -10,7 +10,8 @@ import {
   PageRole,
   type Profile,
 } from '@prisma/client';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AcceptPageInviteDto } from './dto/accept-page-invite.dto';
 import { CreatePageShareDto } from './dto/create-page-share.dto';
@@ -26,7 +27,15 @@ const PAGE_ROLE_PRIORITY: Record<PageRole, number> = {
 
 @Injectable()
 export class PageSharesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly runtimeCache: RuntimeCacheService,
+  ) {}
+
+  private invalidateAccess(workspaceId: string, pageId: string) {
+    this.runtimeCache.invalidateWorkspace(workspaceId);
+    this.runtimeCache.invalidatePage(pageId);
+  }
 
   private async getPageOrThrow(workspaceId: string, pageId: string) {
     const page = await this.prisma.page.findFirst({
@@ -49,8 +58,48 @@ export class PageSharesService {
     return page;
   }
 
+  private async listAncestorPages(
+    pageId: string,
+  ): Promise<Array<{ id: string; title: string; parentId: string | null }>> {
+    const rows = await this.prisma.$queryRaw<
+      Array<{ id: string; title: string; parentId: string | null; depth: number }>
+    >`
+      WITH RECURSIVE ancestors AS (
+        SELECT p.id, p.title, p."parentId", 0::int AS depth
+        FROM "Page" p
+        WHERE p.id = ${pageId}
+        UNION ALL
+        SELECT parent.id, parent.title, parent."parentId", ancestors.depth + 1
+        FROM "Page" parent
+        INNER JOIN ancestors ON ancestors."parentId" = parent.id
+      )
+      SELECT id, title, "parentId", depth
+      FROM ancestors
+      WHERE depth > 0
+      ORDER BY depth ASC
+    `;
+
+    return rows.map(({ id, title, parentId }) => ({ id, title, parentId }));
+  }
+
   private normalizeEmail(email: string) {
     return email.trim().toLowerCase();
+  }
+
+  private hashToken(rawToken: string) {
+    return createHash('sha256').update(rawToken).digest('hex');
+  }
+
+  private isSha256Hash(value: string | null): value is string {
+    return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
+  }
+
+  private toInviteOutput<T extends { tokenHash: string | null }>(invite: T, rawToken?: string) {
+    const { tokenHash, ...rest } = invite;
+    return {
+      ...rest,
+      token: rawToken ?? (tokenHash && !this.isSha256Hash(tokenHash) ? tokenHash : null),
+    };
   }
 
   private createLinkOnlyInviteEmail() {
@@ -70,12 +119,13 @@ export class PageSharesService {
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7);
 
-    return this.prisma.pageInvite.create({
+    const rawToken = randomBytes(24).toString('base64url');
+    const invite = await this.prisma.pageInvite.create({
       data: {
         pageId: params.pageId,
         email: params.email,
         role: params.role,
-        token: randomBytes(24).toString('hex'),
+        tokenHash: this.hashToken(rawToken),
         inviterId: params.inviterId,
         expiresAt,
       },
@@ -89,6 +139,8 @@ export class PageSharesService {
         },
       },
     });
+
+    return this.toInviteOutput(invite, rawToken);
   }
 
   private shareOutput(share: {
@@ -138,26 +190,7 @@ export class PageSharesService {
       orderBy: { createdAt: 'asc' },
     });
 
-    const ancestorPages: Array<{ id: string; title: string; parentId: string | null }> = [];
-    let currentParentId = page.parentId;
-
-    while (currentParentId) {
-      const parent = await this.prisma.page.findUnique({
-        where: { id: currentParentId },
-        select: {
-          id: true,
-          title: true,
-          parentId: true,
-        },
-      });
-
-      if (!parent) {
-        break;
-      }
-
-      ancestorPages.push(parent);
-      currentParentId = parent.parentId;
-    }
+    const ancestorPages = await this.listAncestorPages(page.id);
 
     const inheritedShares =
       ancestorPages.length === 0
@@ -275,6 +308,7 @@ export class PageSharesService {
         },
       });
 
+      this.invalidateAccess(workspaceId, pageId);
       return {
         kind: 'share' as const,
         data: this.shareOutput(share),
@@ -323,6 +357,7 @@ export class PageSharesService {
           },
         });
 
+        this.invalidateAccess(workspaceId, pageId);
         return {
           kind: 'share' as const,
           data: this.shareOutput(share),
@@ -382,6 +417,7 @@ export class PageSharesService {
       },
     });
 
+    this.invalidateAccess(workspaceId, pageId);
     return this.shareOutput(updated);
   }
 
@@ -400,13 +436,14 @@ export class PageSharesService {
       throw new NotFoundException('Page share not found');
     }
 
+    this.invalidateAccess(workspaceId, pageId);
     return { ok: true };
   }
 
   async listPendingInvites(workspaceId: string, pageId: string) {
     await this.getPageOrThrow(workspaceId, pageId);
 
-    return this.prisma.pageInvite.findMany({
+    const invites = await this.prisma.pageInvite.findMany({
       where: {
         pageId,
         acceptedAt: null,
@@ -427,6 +464,8 @@ export class PageSharesService {
         createdAt: 'desc',
       },
     });
+
+    return invites.map((invite) => this.toInviteOutput(invite));
   }
 
   async listAccessRequests(workspaceId: string, pageId: string) {
@@ -514,6 +553,7 @@ export class PageSharesService {
         });
       });
 
+      this.invalidateAccess(workspaceId, pageId);
       return { ok: true };
     }
 
@@ -548,8 +588,9 @@ export class PageSharesService {
   }
 
   async getInvitePreview(token: string) {
-    const invite = await this.prisma.pageInvite.findUnique({
-      where: { token },
+    const tokenHash = this.hashToken(token);
+    let invite = await this.prisma.pageInvite.findUnique({
+      where: { tokenHash },
       include: {
         page: {
           select: {
@@ -566,6 +607,29 @@ export class PageSharesService {
         },
       },
     });
+
+    if (!invite) {
+      // 레거시 호환을 위한 이중 조회. 마이그레이션 완료 후 제거 예정.
+      const legacyInvite = await this.prisma.pageInvite.findUnique({
+        where: { tokenHash: token },
+        include: {
+          page: {
+            select: {
+              id: true,
+              title: true,
+              workspace: {
+                select: {
+                  id: true,
+                  name: true,
+                  linkInviteMode: true,
+                },
+              },
+            },
+          },
+        },
+      });
+      invite = legacyInvite && !this.isSha256Hash(legacyInvite.tokenHash) ? legacyInvite : null;
+    }
 
     if (!invite) {
       throw new NotFoundException('Page invite not found');
@@ -590,8 +654,9 @@ export class PageSharesService {
   }
 
   async acceptInvite(user: Profile, dto: AcceptPageInviteDto) {
-    const invite = await this.prisma.pageInvite.findUnique({
-      where: { token: dto.token },
+    const tokenHash = this.hashToken(dto.token);
+    let invite = await this.prisma.pageInvite.findUnique({
+      where: { tokenHash },
       include: {
         page: {
           select: {
@@ -601,6 +666,22 @@ export class PageSharesService {
         },
       },
     });
+
+    if (!invite) {
+      // 레거시 호환을 위한 이중 조회. 마이그레이션 완료 후 제거 예정.
+      const legacyInvite = await this.prisma.pageInvite.findUnique({
+        where: { tokenHash: dto.token },
+        include: {
+          page: {
+            select: {
+              id: true,
+              workspaceId: true,
+            },
+          },
+        },
+      });
+      invite = legacyInvite && !this.isSha256Hash(legacyInvite.tokenHash) ? legacyInvite : null;
+    }
 
     if (!invite) {
       throw new NotFoundException('Page invite not found');
@@ -653,6 +734,7 @@ export class PageSharesService {
             where: { id: invite.id },
             data: {
               acceptedAt: new Date(),
+              tokenHash: null,
             },
           });
 
@@ -689,6 +771,7 @@ export class PageSharesService {
             where: { id: invite.id },
             data: {
               acceptedAt: new Date(),
+              tokenHash: null,
             },
           });
 
@@ -726,10 +809,12 @@ export class PageSharesService {
         where: { id: invite.id },
         data: {
           acceptedAt: new Date(),
+          tokenHash: null,
         },
       });
     });
 
+    this.invalidateAccess(invite.page.workspaceId, invite.pageId);
     return {
       workspaceId: invite.page.workspaceId,
       pageId: invite.page.id,

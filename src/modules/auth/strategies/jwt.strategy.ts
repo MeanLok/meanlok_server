@@ -77,15 +77,21 @@ async function resolveSigningKey({
   sharedSecret,
   supabaseUrl,
   jwksCache,
+  allowHs256,
 }: {
   rawJwtToken: string;
   sharedSecret?: string;
   supabaseUrl: string;
   jwksCache: JwksCache;
+  allowHs256: boolean;
 }) {
   const { alg, kid } = parseJwtHeader(rawJwtToken);
 
   if (alg === 'HS256') {
+    if (!allowHs256) {
+      throw new UnauthorizedException('HS256 tokens are not allowed');
+    }
+
     if (!sharedSecret) {
       throw new UnauthorizedException(
         'SUPABASE_JWT_SECRET is required for HS256 tokens',
@@ -135,6 +141,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     const sharedSecret = configService.get<string>('SUPABASE_JWT_SECRET')?.trim();
+    const allowHs256 = process.env.NODE_ENV !== 'production';
+    const algorithms: Array<'ES256' | 'HS256'> = ['ES256'];
+    if (allowHs256) {
+      algorithms.push('HS256');
+    }
+
     const jwksCache: JwksCache = {
       payload: null,
       loadedAt: 0,
@@ -143,13 +155,16 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      algorithms: ['ES256', 'HS256'],
+      issuer: `${supabaseUrl}/auth/v1`,
+      audience: 'authenticated',
+      algorithms,
       secretOrKeyProvider: (_request, rawJwtToken, done) => {
         resolveSigningKey({
           rawJwtToken,
           sharedSecret,
           supabaseUrl,
           jwksCache,
+          allowHs256,
         })
           .then((signingKey) => done(null, signingKey))
           .catch((error) => done(error as Error));
@@ -165,13 +180,15 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     const email = payload.email ?? '';
-    const name =
-      payload.user_metadata?.name?.trim() || email.split('@')[0] || 'user';
 
     const profile = await this.prisma.profile.upsert({
       where: { id },
-      update: { email, name },
-      create: { id, email, name },
+      update: {},
+      create: {
+        id,
+        email,
+        name: email.split('@')[0] || 'user',
+      },
     });
 
     return profile;

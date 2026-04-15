@@ -5,33 +5,56 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { Role, type Profile } from '@prisma/client';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AcceptInviteDto } from './dto/accept-invite.dto';
 import { CreateInviteDto } from './dto/create-invite.dto';
 
 @Injectable()
 export class InvitesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly runtimeCache: RuntimeCacheService,
+  ) {}
+
+  private hashToken(rawToken: string) {
+    return createHash('sha256').update(rawToken).digest('hex');
+  }
+
+  private isSha256Hash(value: string | null): value is string {
+    return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
+  }
+
+  private toInviteOutput<T extends { tokenHash: string | null }>(invite: T, rawToken?: string) {
+    const { tokenHash, ...rest } = invite;
+    return {
+      ...rest,
+      token: rawToken ?? (tokenHash && !this.isSha256Hash(tokenHash) ? tokenHash : null),
+    };
+  }
 
   async create(workspaceId: string, inviter: Profile, dto: CreateInviteDto) {
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7);
 
-    return this.prisma.invite.create({
+    const rawToken = randomBytes(24).toString('base64url');
+    const invite = await this.prisma.invite.create({
       data: {
         workspaceId,
         email: dto.email.toLowerCase(),
         role: dto.role ?? Role.EDITOR,
-        token: randomBytes(24).toString('hex'),
+        tokenHash: this.hashToken(rawToken),
         inviterId: inviter.id,
         expiresAt,
       },
     });
+
+    return this.toInviteOutput(invite, rawToken);
   }
 
   async findPending(workspaceId: string) {
-    return this.prisma.invite.findMany({
+    const invites = await this.prisma.invite.findMany({
       where: {
         workspaceId,
         acceptedAt: null,
@@ -41,6 +64,8 @@ export class InvitesService {
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    return invites.map((invite) => this.toInviteOutput(invite));
   }
 
   async remove(workspaceId: string, inviteId: string) {
@@ -59,8 +84,9 @@ export class InvitesService {
   }
 
   async getInvitePreview(token: string) {
-    const invite = await this.prisma.invite.findUnique({
-      where: { token },
+    const tokenHash = this.hashToken(token);
+    let invite = await this.prisma.invite.findUnique({
+      where: { tokenHash },
       include: {
         workspace: {
           select: {
@@ -70,6 +96,22 @@ export class InvitesService {
         },
       },
     });
+
+    if (!invite) {
+      // 레거시 호환을 위한 이중 조회. 마이그레이션 완료 후 제거 예정.
+      const legacyInvite = await this.prisma.invite.findUnique({
+        where: { tokenHash: token },
+        include: {
+          workspace: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+        },
+      });
+      invite = legacyInvite && !this.isSha256Hash(legacyInvite.tokenHash) ? legacyInvite : null;
+    }
 
     if (!invite) {
       throw new NotFoundException('Invite not found');
@@ -91,9 +133,18 @@ export class InvitesService {
   }
 
   async accept(user: Profile, dto: AcceptInviteDto) {
-    const invite = await this.prisma.invite.findUnique({
-      where: { token: dto.token },
+    const tokenHash = this.hashToken(dto.token);
+    let invite = await this.prisma.invite.findUnique({
+      where: { tokenHash },
     });
+
+    if (!invite) {
+      // 레거시 호환을 위한 이중 조회. 마이그레이션 완료 후 제거 예정.
+      const legacyInvite = await this.prisma.invite.findUnique({
+        where: { tokenHash: dto.token },
+      });
+      invite = legacyInvite && !this.isSha256Hash(legacyInvite.tokenHash) ? legacyInvite : null;
+    }
 
     if (!invite) {
       throw new NotFoundException('Invite not found');
@@ -133,9 +184,12 @@ export class InvitesService {
         where: { id: invite.id },
         data: {
           acceptedAt: new Date(),
+          tokenHash: null,
         },
       });
     });
+
+    this.runtimeCache.invalidateWorkspace(invite.workspaceId);
 
     return {
       workspaceId: invite.workspaceId,

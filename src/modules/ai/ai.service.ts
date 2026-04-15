@@ -8,6 +8,8 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomBytes } from 'node:crypto';
+import { RuntimeMetricsService } from '../../common/observability/runtime-metrics.service';
 import { PrismaService } from '../../prisma/prisma.service';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -32,6 +34,7 @@ export interface AiUsageSummary {
 
 @Injectable()
 export class AiService {
+  // 단일 노드 한정 in-memory 쿨다운 저장소.
   private readonly lastRequestAtByUser = new Map<string, number>();
   private readonly dailyRequestLimit: number;
   private readonly maxQuestionChars: number;
@@ -41,6 +44,7 @@ export class AiService {
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly metrics: RuntimeMetricsService,
   ) {
     this.dailyRequestLimit = this.readNumericConfig('AI_DAILY_REQUEST_LIMIT', 20, 1);
     this.maxQuestionChars = this.readNumericConfig('AI_MAX_QUESTION_CHARS', 2000, 100);
@@ -129,54 +133,63 @@ export class AiService {
 
   private async increaseUsage(userId: string): Promise<AiUsageSummary> {
     const { dateKey, resetAt, retryAfterSec } = this.getUsageWindow();
+    const usageRows = await this.prisma.$queryRaw<
+      Array<{ incrementedCount: number | null; currentCount: number }>
+    >`
+      WITH ensure_row AS (
+        INSERT INTO "AiDailyUsage" (
+          "id",
+          "userId",
+          "dateKey",
+          "usedCount",
+          "createdAt",
+          "updatedAt"
+        )
+        VALUES (
+          ${randomBytes(16).toString('hex')},
+          ${userId},
+          ${dateKey},
+          0,
+          NOW(),
+          NOW()
+        )
+        ON CONFLICT ("userId", "dateKey") DO NOTHING
+      ),
+      incremented AS (
+        UPDATE "AiDailyUsage"
+        SET
+          "usedCount" = "usedCount" + 1,
+          "updatedAt" = NOW()
+        WHERE
+          "userId" = ${userId}
+          AND "dateKey" = ${dateKey}
+          AND "usedCount" < ${this.dailyRequestLimit}
+        RETURNING "usedCount"
+      ),
+      current_usage AS (
+        SELECT "usedCount"
+        FROM "AiDailyUsage"
+        WHERE "userId" = ${userId}
+          AND "dateKey" = ${dateKey}
+      )
+      SELECT
+        (SELECT "usedCount" FROM incremented LIMIT 1) AS "incrementedCount",
+        COALESCE((SELECT "usedCount" FROM current_usage LIMIT 1), 0) AS "currentCount"
+    `;
 
-    await this.prisma.aiDailyUsage.upsert({
-      where: {
-        userId_dateKey: {
-          userId,
-          dateKey,
-        },
-      },
-      create: {
-        userId,
-        dateKey,
-        usedCount: 0,
-      },
-      update: {},
-    });
+    const incrementedCount = usageRows[0]?.incrementedCount;
+    const currentCount = Number(usageRows[0]?.currentCount ?? 0);
 
-    const updateResult = await this.prisma.aiDailyUsage.updateMany({
-      where: {
-        userId,
-        dateKey,
-        usedCount: {
-          lt: this.dailyRequestLimit,
-        },
-      },
-      data: {
-        usedCount: {
-          increment: 1,
-        },
-      },
-    });
-
-    if (updateResult.count === 0) {
-      const usage = await this.getUsage(userId);
+    if (incrementedCount === null) {
+      const usage = this.buildUsageSummary(currentCount, resetAt);
       this.throwQuotaExceeded(usage, retryAfterSec);
     }
 
-    const usageRow = await this.prisma.aiDailyUsage.findUnique({
-      where: {
-        userId_dateKey: {
-          userId,
-          dateKey,
-        },
-      },
-      select: {
-        usedCount: true,
-      },
-    });
-    const usedToday = usageRow?.usedCount ?? 0;
+    const usedToday = Number(incrementedCount ?? currentCount);
+    if (!Number.isFinite(usedToday) || usedToday <= 0) {
+      const usage = this.buildUsageSummary(usedToday, resetAt);
+      this.throwQuotaExceeded(usage, retryAfterSec);
+    }
 
     return this.buildUsageSummary(usedToday, resetAt);
   }
@@ -257,6 +270,27 @@ export class AiService {
       },
       HttpStatus.TOO_MANY_REQUESTS,
     );
+  }
+
+  private extractErrorCode(error: unknown): string | null {
+    if (!(error instanceof HttpException)) {
+      return 'UNKNOWN';
+    }
+
+    const response = error.getResponse();
+    if (typeof response === 'object' && response !== null && 'error' in response) {
+      const nestedError = (response as { error?: { code?: unknown } }).error;
+      if (
+        nestedError &&
+        typeof nestedError === 'object' &&
+        'code' in nestedError &&
+        typeof nestedError.code === 'string'
+      ) {
+        return nestedError.code;
+      }
+    }
+
+    return error.name ?? 'HTTP_EXCEPTION';
   }
 
   private validateQuestion(question: string) {
@@ -353,7 +387,7 @@ export class AiService {
 
     const { apiKey, model, baseUrl } = this.getGroqConfig();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30_000);
+    const timeout = setTimeout(() => controller.abort(), 15_000);
 
     try {
       const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -409,48 +443,74 @@ export class AiService {
   }
 
   async ask(userId: string, question: string) {
+    const startedAt = Date.now();
+    let success = false;
+    let errorCode: string | null = null;
+
     const trimmedQuestion = this.validateQuestion(question);
     if (!trimmedQuestion) {
-      return {
-        result: '',
-        usage: await this.getUsage(userId),
-      };
+      try {
+        const response = {
+          result: '',
+          usage: await this.getUsage(userId),
+        };
+        success = true;
+        return response;
+      } finally {
+        this.metrics.recordAiRequest({
+          durationMs: Date.now() - startedAt,
+          success,
+          errorCode,
+        });
+      }
     }
 
-    const usage = await this.getUsage(userId);
-    if (usage.remainingToday <= 0) {
-      const { retryAfterSec } = this.getUsageWindow();
-      this.throwQuotaExceeded(usage, retryAfterSec);
-    }
-
-    if (this.requestCooldownMs > 0) {
-      const now = Date.now();
-      const lastRequestAt = this.lastRequestAtByUser.get(userId);
-
-      if (lastRequestAt) {
-        const elapsedMs = now - lastRequestAt;
-        if (elapsedMs < this.requestCooldownMs) {
-          const retryAfterSec = Math.max(
-            1,
-            Math.ceil((this.requestCooldownMs - elapsedMs) / 1000),
-          );
-          this.throwRateLimited(retryAfterSec);
-        }
+    try {
+      const usage = await this.getUsage(userId);
+      if (usage.remainingToday <= 0) {
+        const { retryAfterSec } = this.getUsageWindow();
+        this.throwQuotaExceeded(usage, retryAfterSec);
       }
 
-      this.lastRequestAtByUser.set(userId, now);
+      if (this.requestCooldownMs > 0) {
+        const now = Date.now();
+        const lastRequestAt = this.lastRequestAtByUser.get(userId);
+
+        if (lastRequestAt) {
+          const elapsedMs = now - lastRequestAt;
+          if (elapsedMs < this.requestCooldownMs) {
+            const retryAfterSec = Math.max(
+              1,
+              Math.ceil((this.requestCooldownMs - elapsedMs) / 1000),
+            );
+            this.throwRateLimited(retryAfterSec);
+          }
+        }
+
+        this.lastRequestAtByUser.set(userId, now);
+      }
+
+      const result = await this.generate(
+        '너는 한국어 문서 협업 도구의 AI 도우미다. 사용자의 질문에 정확하고 실용적으로 답하라. 모르면 모른다고 말하라.',
+        trimmedQuestion,
+      );
+
+      const nextUsage = await this.increaseUsage(userId);
+      success = true;
+
+      return {
+        result,
+        usage: nextUsage,
+      };
+    } catch (error) {
+      errorCode = this.extractErrorCode(error);
+      throw error;
+    } finally {
+      this.metrics.recordAiRequest({
+        durationMs: Date.now() - startedAt,
+        success,
+        errorCode,
+      });
     }
-
-    const result = await this.generate(
-      '너는 한국어 문서 협업 도구의 AI 도우미다. 사용자의 질문에 정확하고 실용적으로 답하라. 모르면 모른다고 말하라.',
-      trimmedQuestion,
-    );
-
-    const nextUsage = await this.increaseUsage(userId);
-
-    return {
-      result,
-      usage: nextUsage,
-    };
   }
 }

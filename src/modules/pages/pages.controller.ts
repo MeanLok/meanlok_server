@@ -41,6 +41,20 @@ export class PagesController {
 
   @UseGuards(PageAccessGuard)
   @PageAccess('VIEWER')
+  @Get(':pageId/meta')
+  findMeta(
+    @Param('workspaceId') workspaceId: string,
+    @Param('pageId') pageId: string,
+    @Req() request: any,
+  ) {
+    return this.pagesService.findMeta(workspaceId, pageId).then((page) => ({
+      ...page,
+      accessRole: request.pageAccess?.role ?? 'VIEWER',
+    }));
+  }
+
+  @UseGuards(PageAccessGuard)
+  @PageAccess('VIEWER')
   @Get(':pageId')
   findOne(
     @Param('workspaceId') workspaceId: string,
@@ -75,7 +89,7 @@ export class PagesController {
   }
 
   @UseGuards(PageAccessGuard)
-  @PageAccess('VIEWER')
+  @PageAccess('EDITOR')
   @Post(':pageId/duplicate')
   duplicate(
     @Param('workspaceId') workspaceId: string,
