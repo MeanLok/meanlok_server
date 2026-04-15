@@ -1,11 +1,15 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { Role } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { UpdateMemberDto } from './dto/update-member.dto';
 
 @Injectable()
 export class MembersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly runtimeCache: RuntimeCacheService,
+  ) {}
 
   async findAll(workspaceId: string) {
     return this.prisma.workspaceMember.findMany({
@@ -39,7 +43,7 @@ export class MembersService {
       throw new ForbiddenException('Owner role cannot be changed');
     }
 
-    return this.prisma.workspaceMember.update({
+    const updated = await this.prisma.workspaceMember.update({
       where: { id: memberId },
       data: { role: dto.role },
       include: {
@@ -52,6 +56,9 @@ export class MembersService {
         },
       },
     });
+
+    this.runtimeCache.invalidateWorkspace(workspaceId);
+    return updated;
   }
 
   async remove(workspaceId: string, memberId: string) {
@@ -73,6 +80,8 @@ export class MembersService {
     await this.prisma.workspaceMember.delete({
       where: { id: memberId },
     });
+
+    this.runtimeCache.invalidateWorkspace(workspaceId);
 
     return { ok: true };
   }

@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { Role, type Profile } from '@prisma/client';
 import { AccessService } from '../../common/services/access.service';
+import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateWorkspaceDto } from './dto/create-workspace.dto';
 import { UpdateWorkspaceDto } from './dto/update-workspace.dto';
@@ -10,10 +11,11 @@ export class WorkspacesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly accessService: AccessService,
+    private readonly runtimeCache: RuntimeCacheService,
   ) {}
 
   async create(user: Profile, dto: CreateWorkspaceDto) {
-    return this.prisma.$transaction(async (tx) => {
+    const workspace = await this.prisma.$transaction(async (tx) => {
       const workspace = await tx.workspace.create({
         data: {
           name: dto.name,
@@ -31,6 +33,9 @@ export class WorkspacesService {
 
       return workspace;
     });
+
+    this.runtimeCache.invalidateWorkspace(workspace.id);
+    return workspace;
   }
 
   async findAll(user: Profile) {
@@ -46,7 +51,7 @@ export class WorkspacesService {
     });
   }
 
-  async findOne(workspaceId: string) {
+  async findOne(workspaceId: string, requesterId?: string) {
     const workspace = await this.prisma.workspace.findUnique({
       where: { id: workspaceId },
       include: {
@@ -62,6 +67,15 @@ export class WorkspacesService {
 
     if (!workspace) {
       throw new NotFoundException('Workspace not found');
+    }
+
+    if (requesterId && requesterId !== workspace.ownerId) {
+      const { owner, ...rest } = workspace;
+      const { email: _email, ...ownerWithoutEmail } = owner;
+      return {
+        ...rest,
+        owner: ownerWithoutEmail,
+      };
     }
 
     return workspace;
@@ -110,7 +124,9 @@ export class WorkspacesService {
       throw new NotFoundException('Workspace not found');
     }
 
-    return this.findOne(workspaceId);
+    const updatedWorkspace = await this.findOne(workspaceId);
+    this.runtimeCache.invalidateWorkspace(workspaceId);
+    return updatedWorkspace;
   }
 
   async remove(workspaceId: string) {
@@ -121,6 +137,8 @@ export class WorkspacesService {
     if (deleted.count === 0) {
       throw new NotFoundException('Workspace not found');
     }
+
+    this.runtimeCache.invalidateWorkspace(workspaceId);
 
     return { ok: true };
   }

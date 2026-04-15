@@ -4,6 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   Role,
   type Page,
@@ -12,8 +13,13 @@ import {
   type PrismaClient,
 } from '@prisma/client';
 import { AccessService } from '../../common/services/access.service';
+import { RuntimeCacheService } from '../../common/runtime-cache/runtime-cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
-import { cloneSubtree, collectDescendantIds } from '../../shared/tree/tree.util';
+import {
+  cloneSubtree,
+  collectDescendantIds,
+  collectDescendantIdsForRoots,
+} from '../../shared/tree/tree.util';
 import { CreatePageDto } from './dto/create-page.dto';
 import { DuplicatePageDto } from './dto/duplicate-page.dto';
 import { MovePageDto } from './dto/move-page.dto';
@@ -29,10 +35,30 @@ const WORKSPACE_EDITOR_PRIORITY: Record<Role, number> = {
 
 @Injectable()
 export class PagesService {
+  private readonly pageCacheTtlMs: number;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly accessService: AccessService,
-  ) {}
+    private readonly configService: ConfigService,
+    private readonly runtimeCache: RuntimeCacheService,
+  ) {
+    const configured = Number(this.configService.get('PAGE_CACHE_TTL_MS') ?? 10_000);
+    this.pageCacheTtlMs = Number.isFinite(configured)
+      ? Math.max(250, Math.trunc(configured))
+      : 10_000;
+  }
+
+  private invalidateWorkspace(workspaceId: string) {
+    this.runtimeCache.invalidateWorkspace(workspaceId);
+  }
+
+  private invalidatePage(pageId: string | null | undefined) {
+    if (!pageId) {
+      return;
+    }
+    this.runtimeCache.invalidatePage(pageId);
+  }
 
   private async getPageOrThrow(
     tx: TxClient,
@@ -100,7 +126,7 @@ export class PagesService {
       _max: { order: true },
     });
 
-    return this.prisma.page.create({
+    const created = await this.prisma.page.create({
       data: {
         workspaceId,
         parentId: dto.parentId ?? null,
@@ -116,90 +142,162 @@ export class PagesService {
         document: true,
       },
     });
+
+    this.invalidateWorkspace(workspaceId);
+    this.invalidatePage(dto.parentId ?? null);
+
+    return created;
   }
 
   async findAll(workspaceId: string, user: Profile) {
-    const memberRole = await this.accessService.getWorkspaceMemberRole(user.id, workspaceId);
+    const workspaceRevision = this.runtimeCache.getWorkspaceRevision(workspaceId);
+    const cacheKey = [
+      'pages:list',
+      `:ws:${workspaceId}:`,
+      `wrev:${workspaceRevision}`,
+      `u:${user.id}`,
+    ].join(':');
 
-    if (memberRole) {
-      const pages = await this.prisma.page.findMany({
-        where: { workspaceId },
-        select: {
-          id: true,
-          title: true,
-          parentId: true,
-          order: true,
-          icon: true,
-        },
-        orderBy: { order: 'asc' },
-      });
+    return this.runtimeCache.getOrSet(
+      cacheKey,
+      async () => {
+        const memberRole = await this.accessService.getWorkspaceMemberRole(user.id, workspaceId);
 
-      return {
-        pages,
-        viewerRole: 'MEMBER' as const,
-        memberRole,
-      };
-    }
+        if (memberRole) {
+          const pages = await this.prisma.page.findMany({
+            where: { workspaceId },
+            select: {
+              id: true,
+              title: true,
+              parentId: true,
+              order: true,
+              icon: true,
+            },
+            orderBy: { order: 'asc' },
+          });
 
-    const rootShareIds = await this.accessService.listAccessibleRootPageIds(
-      user.id,
-      workspaceId,
+          return {
+            pages,
+            viewerRole: 'MEMBER' as const,
+            memberRole,
+          };
+        }
+
+        const rootShareIds = await this.accessService.listAccessibleRootPageIds(
+          user.id,
+          workspaceId,
+        );
+
+        if (rootShareIds.length === 0) {
+          throw new NotFoundException('Workspace not found');
+        }
+
+        const accessibleIdSet = await collectDescendantIdsForRoots(
+          this.prisma,
+          rootShareIds,
+        );
+
+        const pages = await this.prisma.page.findMany({
+          where: {
+            workspaceId,
+            id: {
+              in: [...accessibleIdSet],
+            },
+          },
+          select: {
+            id: true,
+            title: true,
+            parentId: true,
+            order: true,
+            icon: true,
+          },
+          orderBy: { order: 'asc' },
+        });
+
+        return {
+          pages,
+          viewerRole: 'GUEST' as const,
+          memberRole: null,
+        };
+      },
+      this.pageCacheTtlMs,
     );
-
-    if (rootShareIds.length === 0) {
-      throw new NotFoundException('Workspace not found');
-    }
-
-    const accessibleIdSet = new Set<string>();
-    for (const rootShareId of rootShareIds) {
-      const ids = await this.accessService.collectDescendants(rootShareId);
-      ids.forEach((id) => accessibleIdSet.add(id));
-    }
-
-    const pages = await this.prisma.page.findMany({
-      where: {
-        workspaceId,
-        id: {
-          in: [...accessibleIdSet],
-        },
-      },
-      select: {
-        id: true,
-        title: true,
-        parentId: true,
-        order: true,
-        icon: true,
-      },
-      orderBy: { order: 'asc' },
-    });
-
-    return {
-      pages,
-      viewerRole: 'GUEST' as const,
-      memberRole: null,
-    };
   }
 
   async findOne(workspaceId: string, pageId: string) {
-    const page = await this.prisma.page.findFirst({
-      where: {
-        workspaceId,
-        id: pageId,
-      },
-      include: {
-        document: true,
-      },
-    });
+    const workspaceRevision = this.runtimeCache.getWorkspaceRevision(workspaceId);
+    const pageRevision = this.runtimeCache.getPageRevision(pageId);
+    const cacheKey = [
+      'pages:detail',
+      `:ws:${workspaceId}:`,
+      `wrev:${workspaceRevision}`,
+      `:p:${pageId}:`,
+      `prev:${pageRevision}`,
+    ].join(':');
 
-    if (!page) {
-      throw new NotFoundException('Page not found');
-    }
+    return this.runtimeCache.getOrSet(
+      cacheKey,
+      async () => {
+        const page = await this.prisma.page.findFirst({
+          where: {
+            workspaceId,
+            id: pageId,
+          },
+          include: {
+            document: true,
+          },
+        });
 
-    return page;
+        if (!page) {
+          throw new NotFoundException('Page not found');
+        }
+
+        return page;
+      },
+      this.pageCacheTtlMs,
+    );
+  }
+
+  async findMeta(workspaceId: string, pageId: string) {
+    const workspaceRevision = this.runtimeCache.getWorkspaceRevision(workspaceId);
+    const pageRevision = this.runtimeCache.getPageRevision(pageId);
+    const cacheKey = [
+      'pages:meta',
+      `:ws:${workspaceId}:`,
+      `wrev:${workspaceRevision}`,
+      `:p:${pageId}:`,
+      `prev:${pageRevision}`,
+    ].join(':');
+
+    return this.runtimeCache.getOrSet(
+      cacheKey,
+      async () => {
+        const page = await this.prisma.page.findFirst({
+          where: {
+            workspaceId,
+            id: pageId,
+          },
+          select: {
+            id: true,
+            workspaceId: true,
+            title: true,
+            icon: true,
+            updatedAt: true,
+          },
+        });
+
+        if (!page) {
+          throw new NotFoundException('Page not found');
+        }
+
+        return page;
+      },
+      this.pageCacheTtlMs,
+    );
   }
 
   async update(workspaceId: string, pageId: string, dto: UpdatePageDto) {
-    await this.getPageOrThrow(this.prisma, workspaceId, pageId);
+    const currentPage = await this.getPageOrThrow(this.prisma, workspaceId, pageId);
 
     if (dto.parentId === pageId) {
       throw new BadRequestException('Page cannot be parent of itself');
@@ -224,7 +322,7 @@ export class PagesService {
       }
     }
 
-    return this.prisma.page.update({
+    const updated = await this.prisma.page.update({
       where: { id: pageId },
       data: {
         title: dto.title,
@@ -236,14 +334,25 @@ export class PagesService {
         document: true,
       },
     });
+
+    this.invalidateWorkspace(workspaceId);
+    this.invalidatePage(pageId);
+    this.invalidatePage(currentPage.parentId);
+    this.invalidatePage(dto.parentId ?? null);
+
+    return updated;
   }
 
   async remove(workspaceId: string, pageId: string) {
-    await this.getPageOrThrow(this.prisma, workspaceId, pageId);
+    const page = await this.getPageOrThrow(this.prisma, workspaceId, pageId);
 
     await this.prisma.page.delete({
       where: { id: pageId },
     });
+
+    this.invalidateWorkspace(workspaceId);
+    this.invalidatePage(pageId);
+    this.invalidatePage(page.parentId);
 
     return { ok: true };
   }
@@ -254,6 +363,11 @@ export class PagesService {
     user: Profile,
     dto: DuplicatePageDto,
   ) {
+    const sourceAccess = await this.accessService.assertPageAccess(user.id, pageId, 'EDITOR');
+    if (sourceAccess.workspaceId !== workspaceId) {
+      throw new NotFoundException('Page not found');
+    }
+
     await this.getPageOrThrow(this.prisma, workspaceId, pageId);
 
     const targetWorkspaceId = dto.targetWorkspaceId ?? workspaceId;
@@ -261,45 +375,68 @@ export class PagesService {
 
     await this.assertEditableTarget(user.id, targetWorkspaceId, targetParentId);
 
-    return this.prisma.$transaction(async (tx) => {
-      const newRootId = await cloneSubtree(tx, pageId, {
-        targetWorkspaceId,
-        targetParentId,
-        authorId: user.id,
-      });
+    const duplicated = await this.prisma.$transaction(
+      async (tx) => {
+        const newRootId = await cloneSubtree(tx, pageId, {
+          targetWorkspaceId,
+          targetParentId,
+          authorId: user.id,
+        });
 
-      const maxOrder = await tx.page.aggregate({
-        where: {
-          workspaceId: targetWorkspaceId,
-          parentId: targetParentId ?? null,
-          id: { not: newRootId },
-        },
-        _max: { order: true },
-      });
+        const maxOrder = await tx.page.aggregate({
+          where: {
+            workspaceId: targetWorkspaceId,
+            parentId: targetParentId ?? null,
+            id: { not: newRootId },
+          },
+          _max: { order: true },
+        });
 
-      await tx.page.update({
-        where: { id: newRootId },
-        data: {
-          order: (maxOrder._max.order ?? 0) + 1,
-        },
-      });
+        await tx.page.update({
+          where: { id: newRootId },
+          data: {
+            order: (maxOrder._max.order ?? 0) + 1,
+          },
+        });
 
-      return tx.page.findUnique({
-        where: { id: newRootId },
-        include: { document: true },
-      });
-    });
+        return tx.page.findUnique({
+          where: { id: newRootId },
+          include: { document: true },
+        });
+      },
+      { timeout: 30_000, maxWait: 10_000 },
+    );
+
+    this.invalidateWorkspace(targetWorkspaceId);
+    if (targetWorkspaceId !== workspaceId) {
+      this.invalidateWorkspace(workspaceId);
+    }
+    this.invalidatePage(targetParentId ?? null);
+
+    return duplicated;
   }
 
   async move(workspaceId: string, pageId: string, user: Profile, dto: MovePageDto) {
-    await this.getPageOrThrow(this.prisma, workspaceId, pageId);
-
     const targetWorkspaceId = dto.targetWorkspaceId ?? workspaceId;
     const targetParentId = dto.targetParentId ?? null;
 
+    const sourceAccess = await this.accessService.assertPageAccess(user.id, pageId, 'EDITOR');
+    if (sourceAccess.workspaceId !== workspaceId) {
+      throw new NotFoundException('Page not found');
+    }
+    if (!sourceAccess.viaMember) {
+      throw new ForbiddenException('Workspace membership is required to move pages');
+    }
+
+    if (targetWorkspaceId !== workspaceId) {
+      await this.assertWorkspaceEditorRole(user.id, targetWorkspaceId);
+    }
+
     await this.assertEditableTarget(user.id, targetWorkspaceId, targetParentId ?? undefined);
 
-    return this.prisma.$transaction(async (tx) => {
+    const currentPage = await this.getPageOrThrow(this.prisma, workspaceId, pageId);
+
+    const moved = await this.prisma.$transaction(async (tx) => {
       const descendantIds = await collectDescendantIds(tx, pageId);
 
       if (targetParentId && descendantIds.has(targetParentId)) {
@@ -315,6 +452,14 @@ export class PagesService {
           },
           data: {
             workspaceId: targetWorkspaceId,
+          },
+        });
+
+        await tx.pageShare.deleteMany({
+          where: {
+            pageId: {
+              in: [...descendantIds],
+            },
           },
         });
       }
@@ -340,5 +485,13 @@ export class PagesService {
         },
       });
     });
+
+    this.invalidateWorkspace(workspaceId);
+    this.invalidateWorkspace(targetWorkspaceId);
+    this.invalidatePage(pageId);
+    this.invalidatePage(currentPage.parentId);
+    this.invalidatePage(targetParentId);
+
+    return moved;
   }
 }

@@ -34,8 +34,8 @@ export class WorkspacesController {
 
   @UseGuards(WorkspaceRoleGuard)
   @Get(':workspaceId')
-  findOne(@Param('workspaceId') workspaceId: string) {
-    return this.workspacesService.findOne(workspaceId);
+  findOne(@Param('workspaceId') workspaceId: string, @CurrentUser() user: Profile) {
+    return this.workspacesService.findOne(workspaceId, user.id);
   }
 
   @Get(':workspaceId/public-info')

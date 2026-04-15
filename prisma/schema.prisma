@@ -10,7 +10,7 @@ datasource db {
 
 model Profile {
   id              String            @id
-  email           String
+  email           String            @unique
   name            String
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
@@ -92,7 +92,8 @@ model Page {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  @@index([workspaceId, parentId])
+  @@index([workspaceId, parentId, order])
+  @@index([parentId])
 }
 
 enum DocFormat {
@@ -106,7 +107,10 @@ model Document {
   page      Page      @relation(fields: [pageId], references: [id], onDelete: Cascade)
   body      String    @default("")
   format    DocFormat @default(MARKDOWN)
+  version   Int       @default(1)
   updatedAt DateTime  @updatedAt
+
+  @@index([updatedAt])
 }
 
 model Invite {
@@ -115,12 +119,14 @@ model Invite {
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   email       String
   role        Role      @default(EDITOR)
-  token       String    @unique
+  tokenHash   String?   @unique
   inviterId   String
   inviter     Profile   @relation("InviteInviter", fields: [inviterId], references: [id])
   expiresAt   DateTime
   acceptedAt  DateTime?
   createdAt   DateTime  @default(now())
+
+  @@index([workspaceId, acceptedAt, expiresAt, createdAt])
 }
 
 model PageShare {
@@ -144,7 +150,7 @@ model PageInvite {
   page       Page      @relation(fields: [pageId], references: [id], onDelete: Cascade)
   email      String
   role       PageRole  @default(VIEWER)
-  token      String    @unique
+  tokenHash  String?   @unique
   inviterId  String
   inviter    Profile   @relation("PageInviteInviter", fields: [inviterId], references: [id])
   expiresAt  DateTime
@@ -153,6 +159,7 @@ model PageInvite {
 
   @@index([pageId])
   @@index([email])
+  @@index([pageId, acceptedAt, expiresAt, createdAt])
 }
 
 model PageAccessRequest {
@@ -185,4 +192,5 @@ model AiDailyUsage {
 
   @@unique([userId, dateKey])
   @@index([dateKey])
+  @@index([userId, updatedAt])
 }

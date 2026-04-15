@@ -1,7 +1,9 @@
-import { Controller, Get, Param } from '@nestjs/common';
+import { Controller, Get, Param, UseGuards } from '@nestjs/common';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PageSharesService } from './page-shares.service';
 
 @Controller('page-invites')
+@UseGuards(JwtAuthGuard)
 export class PageInvitePreviewController {
   constructor(private readonly pageSharesService: PageSharesService) {}
 

@@ -1,4 +1,5 @@
-import type { Prisma, PrismaClient } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
+import { DocFormat, Prisma, type PrismaClient } from '@prisma/client';
 
 type TxClient = Prisma.TransactionClient | PrismaClient;
 
@@ -12,29 +13,46 @@ export async function collectDescendantIds(
   tx: TxClient,
   rootPageId: string,
 ): Promise<Set<string>> {
-  const collected = new Set<string>([rootPageId]);
-  const queue = [rootPageId];
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+    WITH RECURSIVE subtree AS (
+      SELECT id, "parentId"
+      FROM "Page"
+      WHERE id = ${rootPageId}
+      UNION ALL
+      SELECT p.id, p."parentId"
+      FROM "Page" p
+      INNER JOIN subtree s ON p."parentId" = s.id
+    )
+    SELECT id
+    FROM subtree
+  `;
 
-  while (queue.length > 0) {
-    const currentId = queue.shift();
-    if (!currentId) {
-      continue;
-    }
+  return new Set(rows.map((row) => row.id));
+}
 
-    const children = await tx.page.findMany({
-      where: { parentId: currentId },
-      select: { id: true },
-    });
-
-    for (const child of children) {
-      if (!collected.has(child.id)) {
-        collected.add(child.id);
-        queue.push(child.id);
-      }
-    }
+export async function collectDescendantIdsForRoots(
+  tx: TxClient,
+  rootPageIds: string[],
+): Promise<Set<string>> {
+  if (rootPageIds.length === 0) {
+    return new Set<string>();
   }
 
-  return collected;
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+    WITH RECURSIVE subtree AS (
+      SELECT id, "parentId"
+      FROM "Page"
+      WHERE id IN (${Prisma.join(rootPageIds)})
+      UNION ALL
+      SELECT p.id, p."parentId"
+      FROM "Page" p
+      INNER JOIN subtree s ON p."parentId" = s.id
+    )
+    SELECT DISTINCT id
+    FROM subtree
+  `;
+
+  return new Set(rows.map((row) => row.id));
 }
 
 export async function cloneSubtree(
@@ -42,55 +60,93 @@ export async function cloneSubtree(
   rootPageId: string,
   options: CloneSubtreeOptions,
 ): Promise<string> {
-  const clonePage = async (sourcePageId: string, parentId: string | null): Promise<string> => {
-    const source = await tx.page.findUnique({
-      where: { id: sourcePageId },
-      include: {
-        document: true,
-        children: {
-          orderBy: { order: 'asc' },
-          select: { id: true },
+  const descendantIds = await collectDescendantIds(tx, rootPageId);
+  const sourceIds = [...descendantIds];
+
+  const pages = await tx.page.findMany({
+    where: {
+      id: {
+        in: sourceIds,
+      },
+    },
+    select: {
+      id: true,
+      parentId: true,
+      title: true,
+      icon: true,
+      order: true,
+      document: {
+        select: {
+          body: true,
+          format: true,
         },
       },
-    });
+    },
+  });
 
-    if (!source) {
-      throw new Error('Source page not found');
+  if (pages.length === 0) {
+    throw new Error('Source page not found');
+  }
+
+  const pageById = new Map(pages.map((page) => [page.id, page]));
+  const rootPage = pageById.get(rootPageId);
+  if (!rootPage) {
+    throw new Error('Source page not found');
+  }
+
+  const idMap = new Map<string, string>();
+  for (const page of pages) {
+    idMap.set(page.id, randomUUID());
+  }
+
+  const clonedPages = pages.map((page) => {
+    const clonedId = idMap.get(page.id);
+    if (!clonedId) {
+      throw new Error('Failed to generate page id');
     }
 
-    const created = await tx.page.create({
-      data: {
-        workspaceId: options.targetWorkspaceId,
-        parentId,
-        title: source.title,
-        icon: source.icon,
-        order: source.order,
-        authorId: options.authorId,
-      },
-    });
+    const clonedParentId = page.id === rootPageId
+      ? options.targetParentId ?? null
+      : page.parentId
+        ? idMap.get(page.parentId) ?? null
+        : null;
 
-    if (source.document) {
-      await tx.document.create({
-        data: {
-          pageId: created.id,
-          body: source.document.body,
-          format: source.document.format,
-        },
-      });
-    } else {
-      await tx.document.create({
-        data: {
-          pageId: created.id,
-        },
-      });
+    return {
+      id: clonedId,
+      workspaceId: options.targetWorkspaceId,
+      parentId: clonedParentId,
+      title: page.title,
+      icon: page.icon,
+      order: page.order,
+      authorId: options.authorId,
+    };
+  });
+
+  await tx.page.createMany({
+    data: clonedPages,
+  });
+
+  const clonedDocuments = pages.map((page) => {
+    const pageId = idMap.get(page.id);
+    if (!pageId) {
+      throw new Error('Failed to map page id for document clone');
     }
 
-    for (const child of source.children) {
-      await clonePage(child.id, created.id);
-    }
+    return {
+      pageId,
+      body: page.document?.body ?? '',
+      format: page.document?.format ?? DocFormat.MARKDOWN,
+    };
+  });
 
-    return created.id;
-  };
+  await tx.document.createMany({
+    data: clonedDocuments,
+  });
 
-  return clonePage(rootPageId, options.targetParentId ?? null);
+  const newRootId = idMap.get(rootPage.id);
+  if (!newRootId) {
+    throw new Error('Failed to map cloned root page id');
+  }
+
+  return newRootId;
 }
